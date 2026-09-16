@@ -1,4 +1,4 @@
-# ECoT atomic-action prompt — approved September 8, 2026
+# ECoT production prompt contract
 
 The user approved this prompt with "批准". The exact prompt below is now the
 production four-field contract, with restart gated on tests and a real canary.

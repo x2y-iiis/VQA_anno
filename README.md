@@ -14,6 +14,9 @@ LAS high-concurrency template: `scripts/run_las_high_concurrency.sh`
 The Chinese [architecture](docs/ARCHITECTURE_zh.md) and
 [operations runbook](docs/OPERATIONS_zh.md) document the current production
 data flow, provider routing, recovery boundaries, and concurrency controls.
+The approved four-field ECoT prompt is recorded in
+[docs/ECOT_PROMPT_CONTRACT.md](docs/ECOT_PROMPT_CONTRACT.md). The clean tree was
+refreshed on 2026-09-16.
 
 ## Current contracts
 

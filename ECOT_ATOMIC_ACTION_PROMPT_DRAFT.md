@@ -1,0 +1,1 @@
+docs/ECOT_PROMPT_CONTRACT.md

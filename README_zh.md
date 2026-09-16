@@ -12,7 +12,8 @@
 LAS 高并发模板：`scripts/run_las_high_concurrency.sh`
 
 当前实现说明见 [架构与数据流](docs/ARCHITECTURE_zh.md)，部署、恢复和监控见
-[生产运行手册](docs/OPERATIONS_zh.md)。
+[生产运行手册](docs/OPERATIONS_zh.md)，ECoT 的正式四字段提示词见
+[ECoT prompt contract](docs/ECOT_PROMPT_CONTRACT.md)。整理日期：2026-09-16。
 
 ## 当前五阶段
 
