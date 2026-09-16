@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Install a PyTorch build matching the host CUDA runtime separately.
+# CPA also requires local SAM3 and CoTracker repositories/checkpoints; see README.md.

@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+configs/api.env
+*.pem
+*.key
+
+# Runtime state, generated annotations, caches, and models
+_runtime/
+_diagnostics/
+outputs/
+data/
+models/
+checkpoints/
+media-cache/
+spool/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+*.pid
+*.tmp
+*.jsonl.tmp
+
+# Native helper build products
+*.so
+*.o
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
