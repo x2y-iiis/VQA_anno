@@ -24,9 +24,12 @@ def parse_sources(values, output: Path, tasks) -> list[EcotPriorOutput]:
     if values and set(tasks) != {'ecot'}:
         raise ValueError('ecot_reuse_output_requires_ecot_only')
     sources = []
-    output = output.resolve()
+    # Output may be a COS FUSE mount. Reuse-source validation only needs a
+    # lexical absolute path; resolve() can block in the kernel even when no
+    # ECoT reuse sources were requested (including every GRD/STA startup).
+    output = output.absolute()
     for raw_root, provider, model in values:
-        root = Path(raw_root).resolve()
+        root = Path(raw_root).absolute()
         if provider not in {'ark', 'dashscope'} or not model.strip():
             raise ValueError('ecot_reuse_output_requires_explicit_provider_and_model')
         if (not root.is_dir() or root == output or root.is_relative_to(output)

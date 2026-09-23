@@ -8,7 +8,7 @@ import time
 
 import cv2
 
-from local_json import atomic_json
+from prepare_cpa_comparison import atomic_json
 
 VERSION = 'contact-point-handedness-egocentric-context/v2'
 MODEL = 'doubao-seed-2-0-lite-260215'

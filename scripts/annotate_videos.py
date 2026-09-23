@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
+import fcntl
 import json
 import math
 import mimetypes
@@ -37,6 +38,141 @@ import numpy as np
 VIDEO_CLIP_LIMITER = threading.BoundedSemaphore(4)
 VIDEO_CLIP_POOL = None
 
+_COS_INPUT_CLIENT = None
+_COS_INPUT_CLIENT_LOCK = threading.Lock()
+_COS_INPUT_SLOTS = None
+_COS_INPUT_SLOTS_LOCK = threading.Lock()
+
+
+def _cos_input_concurrency() -> int:
+    try:
+        value = int(os.environ.get('VQA_COS_INPUT_CONCURRENCY', '256'))
+    except ValueError as error:
+        raise ValueError('cos_input_concurrency_invalid') from error
+    if not 1 <= value <= 4096:
+        raise ValueError('cos_input_concurrency_out_of_range')
+    return value
+
+
+@contextlib.contextmanager
+def _cos_input_slot():
+    """Bound physical-shard reads independently of model request depth."""
+    global _COS_INPUT_SLOTS
+    if _COS_INPUT_SLOTS is None:
+        with _COS_INPUT_SLOTS_LOCK:
+            if _COS_INPUT_SLOTS is None:
+                _COS_INPUT_SLOTS = threading.BoundedSemaphore(
+                    _cos_input_concurrency()
+                )
+    _COS_INPUT_SLOTS.acquire()
+    try:
+        yield
+    finally:
+        _COS_INPUT_SLOTS.release()
+
+
+def _cos_input_attempts() -> int:
+    try:
+        value = int(os.environ.get('VQA_COS_INPUT_MAX_ATTEMPTS', '5'))
+    except ValueError as error:
+        raise ValueError('cos_input_max_attempts_invalid') from error
+    if not 1 <= value <= 10:
+        raise ValueError('cos_input_max_attempts_out_of_range')
+    return value
+
+
+def _cos_input_client():
+    """Return one process-wide, sharded COS reader without persisting secrets."""
+    global _COS_INPUT_CLIENT
+    if _COS_INPUT_CLIENT is None:
+        with _COS_INPUT_CLIENT_LOCK:
+            if _COS_INPUT_CLIENT is None:
+                from cos_ecot_images import make_client
+                _COS_INPUT_CLIENT = make_client(_cos_input_concurrency())
+    return _COS_INPUT_CLIENT
+
+
+def _cos_key_for_local_path(path: Path, root_env: str, prefix_env: str) -> str | None:
+    local_root = os.environ.get(root_env)
+    key_prefix = os.environ.get(prefix_env)
+    if not local_root or not key_prefix:
+        return None
+    roots = [local_root]
+    if root_env == 'VQA_COS_PHYSICAL_LOCAL_ROOT':
+        roots.extend(filter(None, os.environ.get(
+            'VQA_COS_PHYSICAL_FALLBACK_LOCAL_ROOTS', '').split(':')))
+    for root in roots:
+        try:
+            relative = path.absolute().relative_to(Path(root).absolute())
+        except ValueError:
+            continue
+        if not relative.parts or '..' in relative.parts:
+            raise ValueError(f'cos_input_path_invalid:{path}')
+        return key_prefix.rstrip('/') + '/' + relative.as_posix()
+    return None
+
+
+def materialize_cos_file(path: Path, root_env: str, prefix_env: str) -> bool:
+    """Fetch one immutable COS object into a process-shared local cache."""
+    path = Path(path)
+    if path.is_file():
+        return True
+    key = _cos_key_for_local_path(path, root_env, prefix_env)
+    if key is None:
+        return False
+    return materialize_cos_file_from_root(
+        path, Path(os.environ[root_env]), os.environ[prefix_env],
+    )
+
+
+def materialize_cos_file_from_root(
+    path: Path, local_root: Path, key_prefix: str, *, refresh_empty: bool = False,
+) -> bool:
+    """Fetch one immutable COS object using explicit, thread-safe mapping."""
+    path = Path(path)
+    if path.is_file() and (not refresh_empty or path.stat().st_size > 0):
+        return True
+    try:
+        relative = path.absolute().relative_to(Path(local_root).absolute())
+    except ValueError:
+        return False
+    if not relative.parts or '..' in relative.parts:
+        raise ValueError(f'cos_input_path_invalid:{path}')
+    key = key_prefix.rstrip('/') + '/' + relative.as_posix()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + '.download.lock')
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if path.is_file() and (not refresh_empty or path.stat().st_size > 0):
+            return True
+        try:
+            response = _cos_input_client().get_object(
+                Bucket='datasets-1409717487', Key=key,
+            )
+        except Exception as error:
+            code = getattr(error, 'response', {}).get('Error', {}).get('Code', '')
+            if str(code) in {'NoSuchKey', '404', 'NotFound'}:
+                return False
+            raise
+        temporary = path.with_name(f'.{path.name}.partial-{os.getpid()}-{threading.get_ident()}')
+        try:
+            with temporary.open('wb') as stream:
+                body = response['Body']
+                while True:
+                    chunk = body.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    stream.write(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
+    finally:
+        os.close(descriptor)
+
 
 def open_video_capture(path):
     """Bound FFmpeg decoder threads explicitly; capture-options is insufficient."""
@@ -47,7 +183,14 @@ def open_video_capture(path):
         raise ValueError('explicit_opencv_decoder_threads_require_supported_opencv_and_1_to_8')
     return cv2.VideoCapture(str(path), cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, threads])
 
-from bounded_media import FrameCache, FrameSelection, REQUEST_BUDGET, fit_video_file, prepare_inline_media
+from bounded_media import (
+    FrameCache,
+    FrameSelection,
+    REQUEST_BUDGET,
+    VIDEO_BUDGET,
+    fit_video_file,
+    prepare_inline_media,
+)
 from dashscope_temporary_video import (
     DashScopeTemporaryPublisher, TemporaryVideo, RESOLVE_HEADER, UPLOAD_TIMEOUT,
     prepare_request_media, refresh_request_urls, redact_media_urls,
@@ -82,18 +225,13 @@ from las_subtask import (
 from sam3_snap import Sam3Snapper, snap_pair_twice
 from validate_annotation_result_contract import validate_annotation_result_contract
 from grd_inventory_review import (
-    InventoryReviewer, MODEL as GRD_REVIEW_MODEL, learner_result,
+    InventoryReviewer, MODEL as GRD_REVIEW_MODEL, REVIEW_PROVIDERS, learner_result,
     partition_result, review_item, review_is_current,
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = Path(os.environ.get('VQA_DEFAULT_INPUT', 'data/input'))
-DEFAULT_OUTPUT = Path(os.environ.get('VQA_DEFAULT_OUTPUT', 'outputs'))
-DEFAULT_SAM3_REPO = Path(os.environ.get('SAM3_REPO', PROJECT_ROOT/'third_party/sam3'))
-DEFAULT_SAM3_CHECKPOINT = Path(os.environ.get(
-    'SAM3_CHECKPOINT', PROJECT_ROOT/'models/sam3/sam3.pt',
-))
+DEFAULT_INPUT = Path('/mnt/poke_real_dataset/vqa_unified_32m_20260828_wds_v1')
+DEFAULT_OUTPUT = Path('/mnt/poke_real_dataset/vqa_anno_raw')
 DEFAULT_ENDPOINTS = {
     'dashscope': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
     'ark': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
@@ -113,20 +251,20 @@ DEFAULT_MODELS = {
     'ark': {
         'subtask': DEFAULT_LAS_MODEL,
         'ecot': 'doubao-seed-2-0-lite-260215',
-        'grd': 'doubao-seed-2-0-pro-260215',
+        'grd': 'doubao-seed-2-1-pro-260628',
         'sta': 'doubao-seed-2-0-lite-260215',
-        'cpa': 'doubao-seed-2-0-pro-260215',
-        'contact_frame': 'doubao-seed-2-0-pro-260215',
-        'cpa_point': 'doubao-seed-2-0-pro-260215',
+        'cpa': 'doubao-seed-2-1-pro-260628',
+        'contact_frame': 'doubao-seed-2-1-pro-260628',
+        'cpa_point': 'doubao-seed-2-1-pro-260628',
     },
     'las': {
         'subtask': DEFAULT_LAS_MODEL,
         'ecot': 'doubao-seed-2-0-lite-260215',
-        'grd': 'doubao-seed-2-0-pro-260215',
+        'grd': 'doubao-seed-2-1-pro-260628',
         'sta': 'doubao-seed-2-0-lite-260215',
-        'cpa': 'doubao-seed-2-0-pro-260215',
-        'contact_frame': 'doubao-seed-2-0-pro-260215',
-        'cpa_point': 'doubao-seed-2-0-pro-260215',
+        'cpa': 'doubao-seed-2-1-pro-260628',
+        'contact_frame': 'doubao-seed-2-1-pro-260628',
+        'cpa_point': 'doubao-seed-2-1-pro-260628',
     },
     'openai-compatible': {
         'subtask': DEFAULT_LAS_MODEL, 'ecot': '', 'grd': '', 'sta': '', 'cpa': '',
@@ -160,8 +298,11 @@ ECOT_MEDIA_KIND = 'complete_0.5fps_episode_video_plus_target_image'
 ECOT_SUBTASK_FIELDS = ('subtask', 'action', 'object', 'source', 'target')
 ECOT_MISSING_SEMANTIC = 'None'
 ECOT_PRIVILEGED_LEAK_PATTERN = re.compile(
-    r'\b(?:video|future frames?|past frames?|timestamps?|progress percentage|'
-    r'episode progress|later in the episode|earlier in the episode)\b',
+    r'\b(?:future frames?|past frames?|timestamps?|progress percentage|'
+    r'episode progress|later in the episode|earlier in the episode|'
+    r'(?:in|from|throughout)\s+(?:the\s+)?video|'
+    r'(?:the\s+)?video\s+(?:shows?|reveals?|indicates?|depicts?|demonstrates?|'
+    r'context|frames?))\b',
     flags=re.I,
 )
 GRD_FRAME_FPS = 2.0
@@ -188,6 +329,8 @@ ECOT_SYSTEM_PROMPT = '''You create structured embodied action labels for one tar
 You receive the global task, the target image, and the complete 0.5 FPS episode video. The video is privileged annotation-only evidence. Match the target image to the episode and use the video to identify task progress, the active goal-level subtask, and the immediate atomic action. Never mention privileged context, timestamps, frame indices, or progress percentages in the output. Do not describe later actions or outcomes as if they were already visible at the target observation.
 
 Return exactly four top-level JSON fields:
+
+Write every output string in English, even when the task instruction or visible text is in another language.
 
 1. scene_description: Concisely describe task-relevant objects, spatial relations, and the visible hands, grippers, or held tools. Every statement must be supported by the target image alone. There is no hard word limit.
 
@@ -229,10 +372,48 @@ class FileSlice:
     offset: int
     length: int
 
+    def _remote_response(self):
+        key = _cos_key_for_local_path(
+            self.path, 'VQA_COS_PHYSICAL_LOCAL_ROOT', 'VQA_COS_PHYSICAL_PREFIX',
+        )
+        if key is None:
+            raise FileNotFoundError(self.path)
+        return _cos_input_client().get_object(
+            Bucket='datasets-1409717487', Key=key,
+            Range=f'bytes={self.offset}-{self.offset + self.length - 1}',
+        )
+
     def read(self) -> bytes:
-        with self.path.open('rb') as stream:
-            stream.seek(self.offset)
-            payload = stream.read(self.length)
+        if self.path.is_file():
+            with self.path.open('rb') as stream:
+                stream.seek(self.offset)
+                payload = stream.read(self.length)
+        else:
+            for attempt in range(1, _cos_input_attempts() + 1):
+                try:
+                    with _cos_input_slot():
+                        response = self._remote_response()
+                        try:
+                            payload = response['Body'].read()
+                        finally:
+                            response['Body'].close()
+                    if len(payload) != self.length:
+                        raise RuntimeError(
+                            f'file_slice_short_read:{self.path}:{self.offset}:'
+                            f'{len(payload)}:{self.length}'
+                        )
+                    break
+                except Exception as error:
+                    if attempt >= _cos_input_attempts():
+                        raise
+                    delay = min(8.0, 0.5 * 2 ** (attempt - 1)) + random.random() * 0.5
+                    print(
+                        'cos_input_retry '
+                        f'attempt={attempt} delay_seconds={delay:.3f} '
+                        f'error_type={type(error).__name__} path={self.path}',
+                        flush=True,
+                    )
+                    time.sleep(delay)
         if len(payload) != self.length:
             raise RuntimeError(
                 f'file_slice_short_read:{self.path}:{self.offset}:'
@@ -243,17 +424,57 @@ class FileSlice:
     def write_to(self, destination, chunk_size: int = 8 * 1024 * 1024) -> None:
         """Copy this slice without retaining the complete payload in memory."""
         remaining = self.length
-        with self.path.open('rb') as source:
-            source.seek(self.offset)
-            while remaining:
-                chunk = source.read(min(chunk_size, remaining))
-                if not chunk:
-                    raise RuntimeError(
-                        f'file_slice_short_read:{self.path}:{self.offset}:'
-                        f'{self.length - remaining}:{self.length}'
-                    )
-                destination.write(chunk)
-                remaining -= len(chunk)
+        if self.path.is_file():
+            source_context = self.path.open('rb')
+            source_context.seek(self.offset)
+            close_source = True
+            try:
+                while remaining:
+                    chunk = source_context.read(min(chunk_size, remaining))
+                    if not chunk:
+                        raise RuntimeError(
+                            f'file_slice_short_read:{self.path}:{self.offset}:'
+                            f'{self.length - remaining}:{self.length}'
+                        )
+                    destination.write(chunk)
+                    remaining -= len(chunk)
+            finally:
+                if close_source:
+                    source_context.close()
+            return
+        start = destination.tell()
+        for attempt in range(1, _cos_input_attempts() + 1):
+            remaining = self.length
+            try:
+                with _cos_input_slot():
+                    response = self._remote_response()
+                    source_context = response['Body']
+                    try:
+                        while remaining:
+                            chunk = source_context.read(min(chunk_size, remaining))
+                            if not chunk:
+                                raise RuntimeError(
+                                    f'file_slice_short_read:{self.path}:{self.offset}:'
+                                    f'{self.length - remaining}:{self.length}'
+                                )
+                            destination.write(chunk)
+                            remaining -= len(chunk)
+                    finally:
+                        source_context.close()
+                return
+            except Exception as error:
+                destination.seek(start)
+                destination.truncate()
+                if attempt >= _cos_input_attempts():
+                    raise
+                delay = min(8.0, 0.5 * 2 ** (attempt - 1)) + random.random() * 0.5
+                print(
+                    'cos_input_retry '
+                    f'attempt={attempt} delay_seconds={delay:.3f} '
+                    f'error_type={type(error).__name__} path={self.path}',
+                    flush=True,
+                )
+                time.sleep(delay)
 
 
 class AdaptiveConcurrencyLimiter:
@@ -955,7 +1176,8 @@ class ApiClient:
     def __init__(self, args: argparse.Namespace):
         self.ecot_image_transport = getattr(args, 'ecot_image_transport', 'inline')
         self.cos_image_publisher = getattr(args, '_cos_image_publisher', None)
-        if self.ecot_image_transport == 'cos-presigned' and self.cos_image_publisher is None:
+        if (self.ecot_image_transport == 'cos-presigned' and self.cos_image_publisher is None
+                and args.api != 'las'):
             from cos_ecot_images import CosImagePublisher
             self.cos_image_publisher = CosImagePublisher(
                 Path(__file__).resolve().parents[1] / '_runtime/cos-ecot-images/pending',
@@ -978,11 +1200,21 @@ class ApiClient:
                 and self.ecot_video_publisher is None):
             if args.api not in {'ark', 'las'}:
                 raise ValueError('cos_presigned_video_transport_requires_ark_or_las')
-            from cos_ecot_images import CosVideoPublisher
-            self.ecot_video_publisher = CosVideoPublisher(
-                Path(__file__).resolve().parents[1] / '_runtime/cos-ecot-videos/pending',
-                workers=args.ark_upload_workers, check=self.ensure_available,
-            )
+            if args.api == 'las':
+                # LAS must receive a GET/HEAD-compatible TOS Policy URL.  Keep
+                # the legacy CLI transport name for checkpoint compatibility,
+                # but do not instantiate or contact the former COS publisher.
+                from las_customer_ark_operator import LASVideoPublisher
+                self.ecot_video_publisher = LASVideoPublisher(
+                    Path(__file__).resolve().parents[1] / '_runtime/tos-ecot-videos',
+                    workers=args.ark_upload_workers, check=self.ensure_available,
+                )
+            else:
+                from cos_ecot_images import CosVideoPublisher
+                self.ecot_video_publisher = CosVideoPublisher(
+                    Path(__file__).resolve().parents[1] / '_runtime/cos-ecot-videos/pending',
+                    workers=args.ark_upload_workers, check=self.ensure_available,
+                )
             args._ecot_video_publisher = self.ecot_video_publisher
             self.ecot_video_publisher.start_cleanup_reaper()
         if (getattr(args, 'ecot_video_transport', 'inline') == 'dashscope-temporary'
@@ -1026,6 +1258,11 @@ class ApiClient:
         self.server_wait_seconds = (getattr(args, 'dashscope_server_wait_seconds', 0)
                                     if self.api == 'dashscope' else 0)
         self.fatal_stop_file = args.fatal_stop_file
+        # ``ensure_available`` is called by every request worker and by LAS
+        # media publishers.  Keep the cache handle on the client itself so
+        # all bound callbacks (including callbacks captured during operator
+        # construction) share the same coalesced check.
+        self._availability_checker = None
         self.rate_state_file = args.rate_state_file
         from coalesced_rate_state import CoalescedRateState
         fair_network = getattr(getattr(args, 'request_admission', None), 'fair_network', False)
@@ -1077,8 +1314,38 @@ class ApiClient:
         self.burst_backoff = getattr(args, 'burst_backoff', None)
         if self.burst_backoff is not None:
             self.burst_backoff.register(self.http_limiter, 'http')
-        self.request_pacer = RequestStartPacer(initial_request_interval,
-                                             timed_recovery=getattr(self.request_admission, 'fair_network', False) is True)
+        # Ark/LAS fixed-concurrency runs also need timed pacing recovery even
+        # when they use the plain request-parallel admission gate.  Restricting
+        # recovery to FairRequestAdmission left GRD/STA permanently parked at
+        # the largest interval learned from a short RPM wave: thousands of
+        # workers remained "active" while almost all of them waited in the
+        # legacy FIFO pacer.  The independent dispatcher does not change the
+        # HTTP/memory ceilings; it only grants paced starts without a thread
+        # convoy and lets the interval recover after the throttle is quiet.
+        timed_pacing_recovery = bool(
+            getattr(self.request_admission, 'fair_network', False) is True
+            or (
+                self.api in {'ark', 'las'}
+                and self.fixed_http_concurrency
+                and self.request_admission is not None
+            )
+        )
+        self.request_pacer = RequestStartPacer(
+            initial_request_interval, timed_recovery=timed_pacing_recovery,
+        )
+        pacer_maximum = os.environ.get('VQA_REQUEST_PACER_MAX_INTERVAL_SECONDS', '').strip()
+        if pacer_maximum:
+            try:
+                pacer_maximum_value = float(pacer_maximum)
+            except ValueError as error:
+                raise ValueError('invalid_request_pacer_max_interval_seconds') from error
+            if (not math.isfinite(pacer_maximum_value)
+                    or pacer_maximum_value < self.request_pacer.base_interval):
+                raise ValueError('invalid_request_pacer_max_interval_seconds')
+            self.request_pacer.max_interval = pacer_maximum_value
+            self.request_pacer.interval_seconds = min(
+                self.request_pacer.interval_seconds, pacer_maximum_value,
+            )
         self.request_pacer.server_queue_mode = self.server_wait_seconds > 0
         if self.api in {'ark', 'las'} and self.request_pacer.timed_recovery:
             self.request_pacer.enable_independent_dispatch()
@@ -1087,7 +1354,8 @@ class ApiClient:
         # learned interval into the user's permanent recovery floor.
         expected_model = getattr(args, 'admission_model', None)
         if (self.fixed_http_concurrency and self.request_pacer.timed_recovery
-                and not self.model_specific_admission and expected_model):
+                and not self.model_specific_admission and expected_model
+                and os.environ.get('VQA_IGNORE_PERSISTED_RATE_STATE') != '1'):
             try:
                 state = json.loads(restore_path.read_text(encoding='utf-8'))
                 if not isinstance(state, dict):
@@ -1163,6 +1431,25 @@ class ApiClient:
         self.presigned_media_fetch_errors = 0
         self.request_failures = 0
         self.max_consecutive_request_failures = getattr(args, 'max_consecutive_request_failures', 20)
+        # A completion-ordered "consecutive failures" counter is not a valid
+        # circuit breaker by itself when thousands of requests are in flight:
+        # a small cohort of failures can finish together between two healthy
+        # completions and reach the threshold in milliseconds.  High-volume
+        # fixed-concurrency runs therefore also require a sustained interval
+        # with no successful response before writing a durable fatal marker.
+        # Legacy/small clients retain immediate threshold semantics.
+        default_circuit_grace = (
+            120.0 if self.fixed_http_concurrency and self.api in {'ark', 'las'} else 0.0
+        )
+        try:
+            self.provider_circuit_grace_seconds = float(os.environ.get(
+                'VQA_PROVIDER_CIRCUIT_GRACE_SECONDS', default_circuit_grace,
+            ))
+        except ValueError as error:
+            raise ValueError('invalid_provider_circuit_grace_seconds') from error
+        if self.provider_circuit_grace_seconds < 0:
+            raise ValueError('invalid_provider_circuit_grace_seconds')
+        self.last_request_success_at = time.monotonic()
         self.las_operator = None
         if self.api == 'las' and self.las_gateway:
             from las_customer_ark_operator import LASCustomerArkOperator, LASVideoPublisher
@@ -1175,10 +1462,41 @@ class ApiClient:
                 publisher.start_cleanup_reaper()
                 args._las_operator_media_publisher = publisher
             self.model_args._las_operator_media_publisher = publisher
+            default_task_root = (
+                Path(getattr(args, 'runtime_state_dir', args.output / '_state'))
+                / 'las-operator-tasks'
+            )
+            local_task_root = os.environ.get('VQA_LAS_TASK_STATE_ROOT', '').strip()
+            configured_fallback_root = os.environ.get(
+                'VQA_LAS_TASK_STATE_FALLBACK_ROOT', ''
+            ).strip()
+            fallback_task_root = None
+            task_root = default_task_root
+            if local_task_root:
+                task_root = Path(local_task_root).absolute()
+                local_base = Path('/run/ti').absolute()
+                if task_root == local_base or not task_root.is_relative_to(local_base):
+                    raise ValueError('las_operator_local_task_state_must_be_under_run_ti')
+                task_root.mkdir(parents=True, exist_ok=True)
+                fallback_task_root = (
+                    Path(configured_fallback_root).absolute()
+                    if configured_fallback_root else default_task_root
+                )
+                if configured_fallback_root and (
+                        fallback_task_root == local_base
+                        or not fallback_task_root.is_relative_to(local_base)):
+                    raise ValueError('las_operator_fallback_state_must_be_under_run_ti')
+            try:
+                fallback_read_concurrency = int(os.environ.get(
+                    'VQA_LAS_TASK_STATE_FALLBACK_CONCURRENCY', '64'))
+            except ValueError as error:
+                raise ValueError('invalid_las_operator_fallback_read_concurrency') from error
             self.las_operator = LASCustomerArkOperator(
                 self.endpoint,
-                Path(getattr(args, 'runtime_state_dir', args.output / '_state')) / 'las-operator-tasks',
+                task_root,
                 publisher,
+                fallback_task_root=fallback_task_root,
+                fallback_read_concurrency=fallback_read_concurrency,
             )
         if restored:
             print(
@@ -1186,6 +1504,15 @@ class ApiClient:
                 f'request_start_interval_seconds={initial_request_interval}',
                 flush=True,
             )
+        # The mounted checkpoint/output filesystem makes even a single
+        # ``Path.exists`` surprisingly expensive.  Thousands of workers used
+        # to perform this check independently on every request.  Cache the
+        # complete provider-availability check for one second; fatal markers
+        # still propagate promptly while eliminating the stat/GIL convoy.
+        from fair_request_admission import CachedAvailabilityCheck
+        self._availability_checker = CachedAvailabilityCheck(
+            self._ensure_available_uncached, interval=1, notification_backend='auto',
+        )
 
     def client_for_model(self, model: str) -> ApiClient:
         if not self.model_specific_admission:
@@ -1257,6 +1584,12 @@ class ApiClient:
         return result
 
     def ensure_available(self) -> None:
+        checker = self._availability_checker
+        if checker is not None:
+            return checker()
+        return self._ensure_available_uncached()
+
+    def _ensure_available_uncached(self) -> None:
         check_content_scope()
         if getattr(self.request_admission, 'fair_network', False):
             if self.request_admission.check_available is not None:
@@ -1294,10 +1627,9 @@ class ApiClient:
                 return None
 
     def record_request_success(self):
-        # A no-op success linearizes at this read; do not reset a later failure.
-        if self.request_failures:
-            with self.rate_lock:
-                self.request_failures = 0
+        with self.rate_lock:
+            self.last_request_success_at = time.monotonic()
+            self.request_failures = 0
 
     def wait_for_provider(self) -> None:
         while True:
@@ -1369,11 +1701,19 @@ class ApiClient:
         base_delay = retry_after if retry_after is not None else default_delay
         cooldown = max(1.0, base_delay / self.rate_utilization)
         fair_network = getattr(self.request_admission, 'fair_network', False)
-        if ((queue_mode or fair_network)
+        distributed_request_local_backoff = (
+            retry_after is None and status == 429
+        )
+        if (((queue_mode or fair_network)
                 and retry_after is None
-                and (concurrency_error or burst_growth or transient_service_overload)):
+                and (concurrency_error or burst_growth or transient_service_overload))
+                or distributed_request_local_backoff):
             # Bounded per-request backoff below remains active. Other requests
-            # need not all stop for an unrequested model-wide cooldown.
+            # need not all stop for an unrequested model-wide cooldown. In the
+            # distributed fleet, pausing every process for 60-80 seconds on an
+            # account 429 synchronized workers into burst/idle waves. The
+            # adaptive pacer and jittered retry still react locally. An
+            # explicit provider Retry-After is always honored.
             cooldown = 0.0
         with self.rate_lock:
             now = time.monotonic()
@@ -1542,6 +1882,28 @@ class ApiClient:
 
     def _request_json_las_operator(self, task, model, system, prompt, media, json_schema=None):
         from las_customer_ark_operator import LASOperatorError, token_usage
+        # Durable LAS completions are local data, not provider requests.  Check
+        # them before request admission/pacing so a restart cannot place tens
+        # of thousands of cache replays ahead of fresh Submit calls.
+        cached = self.las_operator.cached_call(
+            task, model, system, prompt, media, json_schema,
+        )
+        if cached is not None:
+            raw, response = cached
+            print(
+                f'api_request_cache_hit task={task} model={model} '
+                'transport=las_submit_poll admission_consumed=false',
+                flush=True,
+            )
+            try:
+                parsed = parse_json_object(raw)
+            except (ValueError, KeyError, json.JSONDecodeError) as error:
+                self.las_operator.invalidate_last_completed()
+            else:
+                self.record_request_success()
+                if task in {'cpa_semantic_review', 'cpa_student_coordinate', 'cpa_hand_side'}:
+                    raw = json_dumps(response)
+                return parsed, raw
         last_error = None
         for attempt in range(1, self.max_attempts + 1):
             request_started = None
@@ -1922,13 +2284,26 @@ class ApiClient:
                   f'attempts={presigned_media_attempts} provider_circuit_unchanged=true',
                   flush=True)
             raise RuntimeError(f'{self.api}_presigned_media_retries_exhausted:{last_error}')
+        now = time.monotonic()
         with self.rate_lock:
             self.request_failures += 1
             failed = self.request_failures
-        if failed >= self.max_consecutive_request_failures:
+            success_age = max(0.0, now - self.last_request_success_at)
+        circuit_due = (
+            failed >= self.max_consecutive_request_failures
+            and success_age >= self.provider_circuit_grace_seconds
+        )
+        if circuit_due:
             message = f'provider_circuit_open:consecutive_failed_requests={failed}:{last_error}'
             self.record_fatal(0, message, task, model)
             raise FatalProviderError(message)
+        if failed == self.max_consecutive_request_failures:
+            print(
+                f'provider_circuit_threshold_deferred task={task} model={model} '
+                f'failed_requests={failed} success_age_seconds={success_age:.3f} '
+                f'grace_seconds={self.provider_circuit_grace_seconds:.3f}',
+                flush=True,
+            )
         raise RuntimeError(f'{self.api}_request_failed:{last_error}')
 
 
@@ -2001,7 +2376,12 @@ def write_video_payload(destination, payload: bytes | FileSlice) -> None:
 
 def decode_video_path(payload: bytes | FileSlice) -> tuple[str, str]:
     """Borrow a complete immutable video file or return an owned temporary copy."""
-    if isinstance(payload, FileSlice) and payload.offset == 0:
+    # A fresh fleet node may represent a COS-backed shard that intentionally
+    # does not exist on local disk.  Only stat/borrow a genuinely local file;
+    # otherwise stream the slice through FileSlice.write_to(), whose remote
+    # range reader is authoritative.
+    if (isinstance(payload, FileSlice) and payload.offset == 0
+            and payload.path.is_file()):
         if payload.path.stat().st_size == payload.length:
             return str(payload.path), ''
     name = ''
@@ -3377,10 +3757,11 @@ def parse_ecot_result(value: object) -> dict:
     if isinstance(atomic_value, str) and atomic_value != ECOT_MISSING_SEMANTIC:
         atomic_value = atomic_value.lower()
     atomic_action = validate_atomic_action(atomic_value)
-    if ECOT_PRIVILEGED_LEAK_PATTERN.search(
+    leak = ECOT_PRIVILEGED_LEAK_PATTERN.search(
         f'{scene} {progress} {current_subtask["subtask"]} {atomic_action}'
-    ):
-        raise ValueError('ecot_privileged_context_leak')
+    )
+    if leak:
+        raise ValueError(f'ecot_privileged_context_leak:{leak.group(0).lower()}')
     return {
         'scene_description': scene,
         'task_progress': progress,
@@ -3564,17 +3945,19 @@ def _clip_video_path_admitted(source, start, end, fps=None, minimum_duration=Non
             destination = stream.name
         source_duration = end - start
         output_duration = max(source_duration, float(minimum_duration or 0))
-        if fps is not None and output_duration > source_duration:
+        source_timing = None
+        if fps is not None:
             source_fps, source_frame_count, _ = video_path_timing(source)
             last_frame_time = max(0.0, (source_frame_count - 1) / source_fps)
+            source_timing = (source_fps, source_frame_count, last_frame_time)
             if start > last_frame_time + 1e-6:
-                # Some VFR containers report a duration slightly beyond the
-                # final decoded frame.  FFmpeg's trim+tpad path can segfault
-                # when seeking into that frame-less tail.  The future view at
-                # this point is semantically the final frame held for the
-                # requested encoded duration.
+                # Subtask boundaries can inherit a container duration that is
+                # slightly longer than its final decodable frame.  FFmpeg then
+                # exits successfully but writes a header-only MP4 (typically
+                # 262 bytes).  A tail-only subtask is still represented by the
+                # closest real observation, held for the requested duration.
                 return repeated_video_frame_at_path(
-                    source, start, fps, output_duration,
+                    source, last_frame_time, fps, output_duration,
                 )
         command = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
@@ -3606,6 +3989,31 @@ def _clip_video_path_admitted(source, start, end, fps=None, minimum_duration=Non
         value = Path(destination).read_bytes()
         if not value:
             raise RuntimeError('ffmpeg_subtask_clip_empty')
+        if fps is not None and len(value) <= 512:
+            # FFmpeg may return zero for an input interval containing no
+            # decodable frames.  Detect that locally before the LAS adapter
+            # retries the same deterministic 262-byte payload three times.
+            if source_timing is None:
+                source_fps, source_frame_count, _ = video_path_timing(source)
+                last_frame_time = max(0.0, (source_frame_count - 1) / source_fps)
+            else:
+                _, _, last_frame_time = source_timing
+            recovered_at = min(max(0.0, start), last_frame_time)
+            recovered = repeated_video_frame_at_path(
+                source, recovered_at, fps, output_duration,
+            )
+            if len(recovered) <= 512:
+                raise RuntimeError(
+                    f'ffmpeg_subtask_clip_undecodable:size={len(value)}:'
+                    f'recovered_size={len(recovered)}'
+                )
+            print(
+                'ffmpeg_subtask_clip_tail_recovered '
+                f'start={start:.6f} end={end:.6f} '
+                f'recovered_at={recovered_at:.6f} bytes={len(recovered)}',
+                flush=True,
+            )
+            return recovered
         return value
     finally:
         if destination:
@@ -3642,7 +4050,7 @@ def repeated_video_frame_at_path(
                 f'returncode={completed.returncode}:{completed.stderr[-1000:]}'
             )
         value = destination.read_bytes()
-    if not value:
+    if len(value) <= 512:
         raise RuntimeError('grounding_tail_video_empty')
     return value
 
@@ -3743,11 +4151,13 @@ def ordered_future_video(
 
 
 class EcotMediaFactory:
-    """Cache a 2 FPS target grid and a separate 0.5 FPS teacher video."""
+    """Cache a 2 FPS target grid and prepare the complete teacher transport."""
 
     def __init__(self, media: list[tuple[str, bytes | FileSlice]], codec_threads: int = 1,
                  frame_cache_write_through: bool = True, frame_cache_memory_mib: int = 64,
-                 teacher_only: bool = False):
+                 teacher_only: bool = False, teacher_source_direct: bool = False,
+                 source_duration_seconds: float | None = None,
+                 frame_grid_only: bool = False):
         if not 1 <= codec_threads <= 8:
             raise ValueError('video_prepare_codec_threads_must_be_between_1_and_8')
         self.codec_threads = codec_threads
@@ -3756,6 +4166,13 @@ class EcotMediaFactory:
             raise ValueError('frame_cache_memory_mib_must_be_between_1_and_512')
         self.frame_cache_memory_mib = frame_cache_memory_mib
         self.teacher_only = teacher_only
+        self.frame_grid_only = frame_grid_only
+        if frame_grid_only and teacher_only:
+            raise ValueError('frame_grid_only_incompatible_with_teacher_only')
+        if teacher_source_direct and not teacher_only:
+            raise ValueError('teacher_source_direct_requires_teacher_only')
+        self.teacher_source_direct = teacher_source_direct
+        self.source_duration_seconds = source_duration_seconds
         self.media = media
         self.temporary: tempfile.TemporaryDirectory | None = None
         self.root: Path | None = None
@@ -3790,28 +4207,131 @@ class EcotMediaFactory:
         self.video_path = self.root/'episode_2fps.mp4'
         self.teacher_video_path = self.root/'episode_teacher_0.5fps.mp4'
         if video_item is not None:
+            if (self.teacher_only and self.teacher_source_direct
+                    and isinstance(video_item[1], FileSlice)
+                    and isinstance(self.source_duration_seconds, (int, float))
+                    and self.source_duration_seconds > 0):
+                source_duration = float(self.source_duration_seconds)
+                teacher_frames = max(
+                    1, int(math.floor(source_duration * ECOT_TEACHER_FPS + 0.5)),
+                )
+                ratio = int(round(ECOT_FPS / ECOT_TEACHER_FPS))
+                self.sampled_frame_count = teacher_frames * ratio
+                self.teacher_video_path = video_item[1]
+                self.video_path = None
+                print(
+                    'ecot_teacher_source_slice_reused '
+                    f'source_bytes={video_item[1].length} '
+                    f'duration_seconds={source_duration:g} '
+                    f'teacher_sampling_fps={ECOT_TEACHER_FPS:g} '
+                    f'expected_teacher_frames={teacher_frames}',
+                    flush=True,
+                )
+                return self
             self.source_path = self.root/'source.mp4'
             with self.source_path.open('wb') as stream:
                 write_video_payload(stream, video_item[1])
-            self.source_fps, self.source_frame_count, _ = video_path_timing(
+            self.source_fps, self.source_frame_count, source_duration = video_path_timing(
                 self.source_path,
             )
-            if self.teacher_only:
-                # LAS targets frames by timestamp in the 0.5 FPS teacher. A
-                # separate 2 FPS MP4 is never decoded or sent, so generating it
-                # and then transcoding it a second time only burns CPU and I/O.
-                teacher = subprocess.run([
+            if self.frame_grid_only:
+                # GRD consumes the 2 FPS JPEG grid and the original source
+                # path, but never consumes the intermediate 2 FPS H.264 or
+                # the 0.5 FPS teacher video.  Extract the JPEG grid directly
+                # in one decode pass instead of encoding H.264 and decoding
+                # every frame a second time through OpenCV.
+                completed = subprocess.run([
                     'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
                     '-threads', str(self.codec_threads), '-i', str(self.source_path),
-                    '-an', '-vf', f'fps={ECOT_TEACHER_FPS:g}',
-                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-                    '-threads', str(self.codec_threads), '-pix_fmt', 'yuv420p',
-                    '-movflags', '+faststart', str(self.teacher_video_path),
+                    '-an', '-vf', f'fps={ECOT_FPS:g}', '-q:v', '2',
+                    '-threads', str(self.codec_threads), '-start_number', '0',
+                    str(self.target_images.root/'%08d.jpg'),
                 ], capture_output=True, text=True, timeout=1800)
-                if teacher.returncode or not self.teacher_video_path.is_file():
+                frame_paths = sorted(self.target_images.root.glob('*.jpg'))
+                if completed.returncode or not frame_paths:
                     raise RuntimeError(
-                        f'ffmpeg_ecot_teacher_video_failed:{teacher.stderr[-2000:]}'
+                        f'ffmpeg_grd_frame_grid_failed:{completed.stderr[-2000:]}'
                     )
+                with self.target_images.lock:
+                    self.target_images.paths.update({
+                        index: path for index, path in enumerate(frame_paths)
+                    })
+                self.sampled_frame_count = len(frame_paths)
+                self.video_path = None
+                self.teacher_video_path = None
+                print(
+                    'grd_frame_grid_prepared '
+                    f'source_bytes={self.source_path.stat().st_size} '
+                    f'frames={self.sampled_frame_count} '
+                    f'duration_seconds={source_duration:g}',
+                    flush=True,
+                )
+                return self
+            if self.teacher_only:
+                if self.teacher_source_direct:
+                    # The LAS request carries fps=0.5, so LAS samples this
+                    # complete source at exactly the same teacher rate.  The
+                    # ffmpeg fps filter rounds half up; preserve that grid size
+                    # for learner target timestamps without decoding video.
+                    teacher_frames = max(
+                        1,
+                        int(math.floor(source_duration * ECOT_TEACHER_FPS + 0.5)),
+                    )
+                    ratio = int(round(ECOT_FPS / ECOT_TEACHER_FPS))
+                    self.sampled_frame_count = teacher_frames * ratio
+                    self.teacher_video_path = self.source_path
+                    self.video_path = None
+                    print(
+                        'ecot_teacher_source_transport_reused '
+                        f'source_bytes={self.source_path.stat().st_size} '
+                        f'duration_seconds={source_duration:g} '
+                        f'teacher_sampling_fps={ECOT_TEACHER_FPS:g} '
+                        f'expected_teacher_frames={teacher_frames}',
+                        flush=True,
+                    )
+                    return self
+                # LAS performs the authoritative 0.5 FPS sampling again from
+                # this complete teacher transport. Produce the bounded
+                # transport in one pass: the previous CRF encode followed by
+                # fit_video_file() decoded and encoded every frame twice.
+                _, _, source_duration = video_path_timing(self.source_path)
+                bitrate = max(
+                    1000,
+                    int(VIDEO_BUDGET * 8 * 0.80 / max(source_duration, 0.1)),
+                )
+                teacher = None
+                for edge in (960, 640, 384):
+                    teacher = subprocess.run([
+                        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                        '-threads', str(self.codec_threads), '-i', str(self.source_path),
+                        '-an', '-vf', (
+                            f"fps={ECOT_TEACHER_FPS:g},"
+                            f"scale=w='min({edge},iw)':h='min({edge},ih)':"
+                            'force_original_aspect_ratio=decrease:force_divisible_by=2'
+                        ),
+                        '-c:v', 'libx264', '-preset', 'veryfast',
+                        '-b:v', str(bitrate), '-maxrate', str(bitrate),
+                        '-bufsize', str(bitrate * 2),
+                        '-threads', str(self.codec_threads), '-pix_fmt', 'yuv420p',
+                        '-movflags', '+faststart', str(self.teacher_video_path),
+                    ], capture_output=True, text=True, timeout=1800)
+                    if teacher.returncode:
+                        raise RuntimeError(
+                            f'ffmpeg_ecot_teacher_video_failed:{teacher.stderr[-2000:]}'
+                        )
+                    if self.teacher_video_path.stat().st_size <= VIDEO_BUDGET:
+                        print(
+                            'ecot_teacher_transport_prepared '
+                            f'source_bytes={self.source_path.stat().st_size} '
+                            f'request_bytes={self.teacher_video_path.stat().st_size} '
+                            f'duration_seconds={source_duration:g} max_edge={edge}',
+                            flush=True,
+                        )
+                        break
+                    bitrate = int(bitrate * 0.7)
+                if (teacher is None or not self.teacher_video_path.is_file()
+                        or self.teacher_video_path.stat().st_size > VIDEO_BUDGET):
+                    raise RuntimeError('ecot_teacher_transport_cannot_fit_request_budget')
                 teacher_fps, teacher_frames, _ = video_path_timing(self.teacher_video_path)
                 if abs(teacher_fps - ECOT_TEACHER_FPS) > 0.01 or teacher_frames < 1:
                     raise RuntimeError(
@@ -3893,8 +4413,11 @@ class EcotMediaFactory:
         if self._video_transport_path is None:
             if self.teacher_video_path is None or self.root is None:
                 raise RuntimeError('ecot_media_factory_not_entered')
-            self._video_transport_path = fit_video_file(
-                self.teacher_video_path, self.root/'teacher_transport.mp4',
+            self._video_transport_path = (
+                self.teacher_video_path
+                if self.teacher_only else fit_video_file(
+                    self.teacher_video_path, self.root/'teacher_transport.mp4',
+                )
             )
         return self._video_transport_path
 
@@ -3919,8 +4442,6 @@ class EcotMediaFactory:
         self, sampled_frame_indices: list[int],
     ) -> dict[int, tuple[str, bytes]]:
         """Return selected 2 FPS frames, decoding every requested frame at most once."""
-        if self.video_path is None:
-            raise RuntimeError('ecot_media_factory_not_entered')
         wanted = set(sampled_frame_indices)
         if not wanted:
             return {}
@@ -3932,6 +4453,8 @@ class EcotMediaFactory:
             raise ValueError(f'ecot_target_frame_indices_invalid:{sorted(invalid)}')
         missing = wanted - set(self.target_images)
         if missing:
+            if self.video_path is None:
+                raise RuntimeError('ecot_media_factory_not_entered')
             self.target_image_decode_passes += 1
             capture = open_video_capture(self.video_path)
             try:
@@ -4319,13 +4842,22 @@ def annotate_ecot_source(
 
 
 def subtask_media(media: list[tuple[str, bytes]], step: dict) -> tuple[list[tuple[str, bytes]], dict]:
+    """Build the temporal evidence used by STA/CPA proposal and review.
+
+    Contact proposal/review is sampled at 2 FPS by the LAS operator. Encoding
+    every source frame into each subtask clip therefore spends most local CPU
+    on frames the operator immediately discards. Downsample during the seek/
+    trim encode while keeping the original source available for exact contact
+    frame selection and STA observations.
+    """
     for mime_type, payload in media:
         if mime_type.startswith('video/'):
             start = float(step['start_time_seconds'])
             end = float(step['end_time_seconds'])
-            return [('video/mp4', clip_video(payload, start, end))], {
+            return [('video/mp4', clip_video(payload, start, end, fps=2.0))], {
                 'kind': 'video_clip', 'start_time_seconds': start,
                 'end_time_seconds': end, 'duration_seconds': end - start,
+                'encoded_fps': 2.0,
             }
     start = int(step['media_start_index'])
     end = int(step['media_end_index'])
@@ -5337,10 +5869,37 @@ def add_sam3_points(
         )
         def review_snapped(candidate):
             from cpa_semantic_review import review_contact_points
-            previous_attempts = (checkpoint.get(checkpoint_key + ':review_attempts') or {}).get('attempts', []) if checkpoint is not None else []
+            previous_attempts = []
+            if checkpoint is not None:
+                # Older checkpoints stored the cumulative attempt list in one
+                # immutable unit. Keep reading that format, but never update it:
+                # a second attempt would otherwise conflict with the first value.
+                legacy = checkpoint.get(checkpoint_key + ':review_attempts')
+                if isinstance(legacy, dict):
+                    previous_attempts.extend(copy.deepcopy(legacy.get('attempts') or []))
+                attempt_index = len(previous_attempts)
+                while True:
+                    saved = checkpoint.get(
+                        f'{checkpoint_key}:review_attempt:{attempt_index}'
+                    )
+                    if not isinstance(saved, dict) or 'attempt' not in saved:
+                        break
+                    previous_attempts.append(copy.deepcopy(saved['attempt']))
+                    attempt_index += 1
+            persisted_current_attempts = 0
             def save_attempts(attempts):
+                nonlocal persisted_current_attempts
                 if checkpoint is not None:
-                    checkpoint.put(checkpoint_key + ':review_attempts', {'attempts': previous_attempts + attempts})
+                    # The callback receives the cumulative attempts from this
+                    # invocation. Persist only its new suffix under one stable,
+                    # immutable key per attempt so retries remain resumable.
+                    for attempt in attempts[persisted_current_attempts:]:
+                        index = len(previous_attempts) + persisted_current_attempts
+                        checkpoint.put(
+                            f'{checkpoint_key}:review_attempt:{index}',
+                            {'attempt': copy.deepcopy(attempt)},
+                        )
+                        persisted_current_attempts += 1
             reviewed = review_contact_points(semantic_reviewer, candidate, frame_bgr, crop_bgr,
                                               attempt_callback=save_attempts)
             reviewed['contact_semantic_review']['attempts'] = previous_attempts + reviewed['contact_semantic_review']['attempts']
@@ -5452,6 +6011,198 @@ def add_sam3_points(
     return value, audits
 
 
+def reused_contact_bbox_prompt(step: dict, event: dict) -> str:
+    """Request only the view-specific interaction crop for a reused final contact."""
+    return (
+        f'Current subtask: {step.get("subtask")}\n'
+        f'Known CPA-final contact event: {cpa_contact_event_name(event)}.\n'
+        'The supplied image is the already selected exact contact frame in a different '
+        'camera view. Do not select or change the event or contact time. Return only '
+        '{"interaction_bbox_xyxy_1000":[0,0,1000,1000],"reason":"..."}. '
+        'The tight bbox must contain the visible contact agent, contacted object, and '
+        'their contact interface. Coordinates use the full-image 0-to-1000 grid.'
+    )
+
+
+def complete_cpa_from_sta_final(
+    reused: dict,
+    subtasks: dict,
+    media: list[tuple[str, bytes | FileSlice]],
+    client: ApiClient,
+    models: dict,
+    snapper: Sam3Snapper,
+    crop_padding: float,
+    crop_size: int,
+    checkpoint: AnnotationUnitCheckpoint | None,
+) -> tuple[dict, list[dict]]:
+    """Run only the CPA point tail from strict STA-final contact evidence."""
+    from sta_contact_reuse import cpa_seed_from_sta
+
+    value = cpa_seed_from_sta(reused, subtasks)
+    requests = [{
+        'stage': 'cpa_sta_final_contact_reuse',
+        'source_record_uid': reused['record_uid'],
+        'source_record_sha256': reused['record_sha256'],
+        'source_path': reused['path'],
+        'primary_view': reused['primary_view'],
+        'skipped_stages': ['sta_proposal', 'cpa_review', 'contact_frame'],
+    }]
+    fps = frame_count = None
+    if not reused['primary_view']:
+        video_payload = next((payload for mime, payload in media if mime.startswith('video/')), None)
+        if video_payload is None:
+            raise ValueError('sta_reuse_secondary_view_requires_video')
+        fps, frame_count, _ = video_frame_timing(video_payload)
+        if fps <= 0 or frame_count <= 0:
+            raise ValueError('sta_reuse_secondary_view_video_timing_invalid')
+    for segment in value['subtask_results']:
+        step = segment['subtask']
+        start = float(step['start_time_seconds'])
+        local = copy.deepcopy(segment['result'])
+        for event_index, event in enumerate(local.get('reviewed_contact_events') or []):
+            global_time = float(event['contact_time_seconds'])
+            if reused['primary_view']:
+                if not isinstance(event.get('contact_source_frame_index'), int):
+                    raise ValueError(
+                        f'sta_reuse_primary_frame_index_missing:{step.get("id")}:{event.get("event_id")}'
+                    )
+                frame_index = event['contact_source_frame_index']
+                target_time = global_time
+            else:
+                maximum_time = (frame_count - 1) / fps
+                # Multi-camera files for one episode can differ by a few
+                # encoded frames even though their semantic timeline is the
+                # same.  Clamp a contact that falls just beyond the target
+                # view's final frame; reject only a material (>1.0 s) mismatch.
+                # Real synchronized camera files in this corpus differ by up
+                # to two 2-fps frames at the encoded tail.
+                # Audited corpus pairs include a small number of camera tails
+                # that differ by about 1.2 seconds.  Keep the tolerance narrow
+                # enough to reject a materially different recording while
+                # covering the observed synchronized-view encoder skew.
+                end_tolerance = max(1.5, 0.5 / fps)
+                if not 0 <= global_time <= maximum_time + end_tolerance:
+                    raise ValueError(
+                        f'sta_reuse_contact_time_outside_target_view:{global_time}:{maximum_time}'
+                    )
+                frame_index = min(frame_count - 1, max(0, int(round(global_time * fps))))
+                target_time = round(frame_index / fps, 6)
+                active_step = subtask_at_time(subtasks, target_time)
+                # Synchronized camera files in the production corpus can have
+                # a small timestamp-origin skew in addition to frame
+                # quantization.  Audited wrist-view pairs differ by as much as
+                # 0.34 seconds at a subtask transition.  Permit only an
+                # adjacent subtask and only within 0.5 seconds of the expected
+                # boundary; material cross-event remaps still fail closed.
+                boundary_tolerance = max(0.5, 0.5 / fps + 1e-3)
+                step_start = float(step.get('start_time_seconds', 0.0))
+                step_end = float(step.get('end_time_seconds', step_start))
+                within_boundary_tolerance = (
+                    abs(target_time - step_start) <= boundary_tolerance
+                    or abs(target_time - step_end) <= boundary_tolerance
+                )
+                try:
+                    adjacent_subtask = abs(
+                        int(active_step.get('id')) - int(step.get('id'))
+                    ) == 1
+                except (AttributeError, TypeError, ValueError):
+                    adjacent_subtask = False
+                boundary_remap_is_safe = (
+                    within_boundary_tolerance and adjacent_subtask
+                )
+                if (
+                    active_step is None
+                    or str(active_step.get('id')) != str(step.get('id'))
+                ) and not boundary_remap_is_safe:
+                    raise ValueError(
+                        f'sta_reuse_target_frame_subtask_mismatch:{step.get("id")}:'
+                        f'{None if active_step is None else active_step.get("id")}:{target_time}'
+                    )
+                event['sta_reused_contact_frame_selection'] = copy.deepcopy(
+                    event.get('contact_frame_selection')
+                )
+                event['contact_source_frame_index'] = frame_index
+                event['contact_time_seconds'] = target_time
+                event['contact_frame_selection'] = {
+                    'version': 'sta_final_time_target_view_remap_v1',
+                    'valid_contact': True,
+                    'requested_subtask_id': step.get('id'),
+                    'selected_media_index': None,
+                    'selected_candidate': {
+                        'source_frame_index': frame_index,
+                        'timestamp_seconds': target_time,
+                        'subtask_id': step.get('id'),
+                        'subtask': step.get('subtask'),
+                    },
+                    'reason': 'Reused the STA CPA-final event time and mapped it to the nearest frame in this camera view.',
+                    'candidate_count': 1,
+                    'crosses_subtask_boundary': False,
+                }
+            bbox = event.get('interaction_bbox_xyxy_1000')
+            try:
+                bbox_values = [float(item) for item in bbox]
+            except (TypeError, ValueError, OverflowError):
+                bbox_values = []
+            bbox_is_valid = (
+                len(bbox_values) == 4
+                and 0 <= bbox_values[0] < bbox_values[2] <= 1000
+                and 0 <= bbox_values[1] < bbox_values[3] <= 1000
+            )
+            # Some otherwise CPA-final STA records retained the model's
+            # sentinel [0, 0, 0, 0] bbox.  A four-element list is not enough:
+            # repair any geometrically invalid primary-view bbox with the same
+            # exact-frame bbox request already used for secondary views.
+            needs_bbox = not reused['primary_view'] or not bbox_is_valid
+            if needs_bbox:
+                bbox_key = (
+                    f'sta_reuse_bbox:{reused["record_sha256"]}:{step.get("id")}:'
+                    f'{event_index}:{event.get("event_id")}:{frame_index}'
+                )
+                cached = checkpoint.get(bbox_key) if checkpoint is not None else None
+                if isinstance(cached, dict):
+                    bbox = cached['bbox']
+                    audit = copy.deepcopy(cached['audit'])
+                else:
+                    frame = extract_media_frame(media, event)
+                    ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 96])
+                    if not ok:
+                        raise RuntimeError('sta_reuse_secondary_bbox_frame_encode_failed')
+                    prompt = reused_contact_bbox_prompt(step, event)
+                    response, raw = client.request_json(
+                        'cpa_reuse_bbox', models['cpa'],
+                        'You draw one tight interaction bbox on a known exact contact frame. Return only JSON.',
+                        prompt, [('image/jpeg', encoded.tobytes())],
+                    )
+                    bbox = response.get('interaction_bbox_xyxy_1000')
+                    # Reuse the production crop validator to reject malformed boxes.
+                    expanded_interaction_crop(frame, bbox, 0.0, max(frame.shape[:2]))
+                    bbox = [int(round(float(item))) for item in bbox]
+                    audit = {
+                        'stage': (
+                            'cpa_sta_final_primary_view_bbox'
+                            if reused['primary_view']
+                            else 'cpa_sta_final_secondary_view_bbox'
+                        ),
+                        'model': models['cpa'], 'subtask_id': step.get('id'),
+                        'event_id': event.get('event_id'), 'source_frame_index': frame_index,
+                        'timestamp_seconds': target_time, 'prompt': prompt,
+                        'raw_response': raw, 'interaction_bbox_xyxy_1000': bbox,
+                    }
+                    if checkpoint is not None:
+                        checkpoint.put(bbox_key, {'bbox': bbox, 'audit': audit})
+                event['interaction_bbox_xyxy_1000'] = bbox
+                requests.append(audit)
+            event['contact_time_seconds'] = round(float(event['contact_time_seconds']) - start, 6)
+        local, point_requests = add_sam3_points(
+            client, snapper, models['cpa_point'], step, [], media, start, local,
+            crop_padding, crop_size, checkpoint=checkpoint,
+            checkpoint_prefix=f'sta_reuse:{reused["record_sha256"]}:subtask:{step.get("id")}:',
+        )
+        segment['result'] = globalize_times(local, start)
+        requests.extend(point_requests)
+    return value, requests
+
+
 def globalize_times(result: dict, offset: float) -> dict:
     value = copy.deepcopy(result)
     events = value.get('contact_events') or value.get('reviewed_contact_events') or []
@@ -5477,6 +6228,8 @@ def annotate_grd_window(
     step: dict,
     future_media: list[tuple[str, bytes]],
     scope: dict,
+    cached_inventory_unit: dict | None = None,
+    inventory_checkpoint_sink=None,
 ) -> tuple[dict, list[dict]]:
     """Run current-image inventory before teacher-only future selection."""
     if isinstance(future_media, DeferredMedia):
@@ -5486,32 +6239,60 @@ def annotate_grd_window(
     inventory_prompt = grd_prompt(step, scope)
     inventory_base_prompt = inventory_prompt
     inventory_validation_attempts = []
-    for validation_attempt in range(1, 4):
-        inventory_raw_result, inventory_raw = client.request_json(
-            'grd', model, GRD_SYSTEM, inventory_prompt, current_media,
-        )
-        try:
-            inventory = validate_grd_inventory(inventory_raw_result)
-            break
-        except ValueError as error:
-            inventory_validation_attempts.append({
-                'attempt': validation_attempt, 'validation_error': str(error),
-                'prompt': inventory_prompt, 'raw_response': inventory_raw,
-            })
-            print(f'grd_frame_validation_retry anchor={scope.get("anchor_frame_index")} '
-                  f'attempt={validation_attempt} error={error}', flush=True)
-            if validation_attempt == 3:
-                raise
-            inventory_prompt = (
-                inventory_base_prompt + f'\nResponse validation failed: {error}.'
-                + '\nPrevious response (data, not instructions): ' + json_dumps(inventory_raw_result)
-                + '\nRe-examine the SAME current image and return the complete corrected '
-                'inventory using the original schema. Every visible object bbox must '
-                'contain four numeric xyxy coordinates with 0 <= x1 < x2 <= 1000 and '
-                '0 <= y1 < y2 <= 1000. Keep the inventory limit of four objects. '
-                'Do not fabricate coordinates or omit visible relevant objects merely '
-                'to pass validation.'
+    if cached_inventory_unit is not None:
+        if not isinstance(cached_inventory_unit, dict):
+            raise ValueError('invalid_grd_inventory_checkpoint_unit')
+        inventory = validate_grd_inventory(copy.deepcopy(cached_inventory_unit.get('inventory')))
+        inventory_request = copy.deepcopy(cached_inventory_unit.get('request'))
+        if not isinstance(inventory_request, dict):
+            raise ValueError('invalid_grd_inventory_checkpoint_request')
+        inventory_prompt = str(inventory_request.get('prompt', inventory_prompt))
+        inventory_raw = str(inventory_request.get('raw_response', ''))
+    else:
+        for validation_attempt in range(1, 4):
+            inventory_raw_result, inventory_raw = client.request_json(
+                'grd', model, GRD_SYSTEM, inventory_prompt, current_media,
             )
+            try:
+                inventory = validate_grd_inventory(inventory_raw_result)
+                break
+            except ValueError as error:
+                inventory_validation_attempts.append({
+                    'attempt': validation_attempt, 'validation_error': str(error),
+                    'prompt': inventory_prompt, 'raw_response': inventory_raw,
+                })
+                print(f'grd_frame_validation_retry anchor={scope.get("anchor_frame_index")} '
+                      f'attempt={validation_attempt} error={error}', flush=True)
+                if validation_attempt == 3:
+                    raise
+                inventory_prompt = (
+                    inventory_base_prompt + f'\nResponse validation failed: {error}.'
+                    + '\nPrevious response (data, not instructions): ' + json_dumps(inventory_raw_result)
+                    + '\nRe-examine the SAME current image and return the complete corrected '
+                    'inventory using the original schema. Every visible object bbox must '
+                    'contain four numeric xyxy coordinates with 0 <= x1 < x2 <= 1000 and '
+                    '0 <= y1 < y2 <= 1000. Keep the inventory limit of four objects. '
+                    'Do not fabricate coordinates or omit visible relevant objects merely '
+                    'to pass validation.'
+                )
+        inventory_request = {
+            'stage': 'current_frame_inventory',
+            'subtask_id': step['id'], 'task_instruction': instruction,
+            'task_instruction_source': 'subtask', 'model': model,
+            'media_kind': 'single_current_image',
+            'prompt': inventory_prompt, 'raw_response': inventory_raw,
+        }
+        if inventory_validation_attempts:
+            inventory_request['base_prompt'] = inventory_base_prompt
+            inventory_request['validation_attempts'] = inventory_validation_attempts
+        if inventory_checkpoint_sink is not None:
+            # Make question 1 durable before question 2 starts. A failure or
+            # restart during future-object selection must not pay for the
+            # already completed inventory request again.
+            inventory_checkpoint_sink({
+                'inventory': copy.deepcopy(inventory),
+                'request': copy.deepcopy(inventory_request),
+            })
     selection_prompt = grd_first_object_prompt(step, scope, inventory)
     if isinstance(future_media, DeferredMedia):
         client.ensure_available()
@@ -5573,13 +6354,7 @@ def annotate_grd_window(
         'media_scope': recorded_scope,
         'result': result,
     }
-    requests = [{
-        'stage': 'current_frame_inventory',
-        'subtask_id': step['id'], 'task_instruction': instruction,
-        'task_instruction_source': 'subtask', 'model': model,
-        'media_kind': 'single_current_image',
-        'prompt': inventory_prompt, 'raw_response': inventory_raw,
-    }, {
+    requests = [inventory_request, {
         'stage': 'future_first_object_selection',
         'subtask_id': step['id'], 'task_instruction': instruction,
         'task_instruction_source': 'subtask', 'model': model,
@@ -5588,9 +6363,6 @@ def annotate_grd_window(
     }]
     if invalid_selection_request is not None:
         requests.insert(1, invalid_selection_request)
-    if inventory_validation_attempts:
-        requests[0]['base_prompt'] = inventory_base_prompt
-        requests[0]['validation_attempts'] = inventory_validation_attempts
     return output, requests
 
 
@@ -5701,6 +6473,39 @@ class GrdWindowCheckpoint:
     def keys(self) -> set[str]:
         with self.lock:
             return set(self.entries)
+
+    @staticmethod
+    def inventory_key(key: str) -> str:
+        return f'__inventory_v1__:{key}'
+
+    def get_inventory(self, key: str) -> dict | None:
+        """Return question-1 evidence saved before first-object selection."""
+        inventory_key = self.inventory_key(key)
+        with self.lock:
+            value = self.entries.get(inventory_key)
+            if value is None:
+                return None
+            item, requests = value
+            if not isinstance(item, dict) or item.get('checkpoint_stage') != 'inventory_v1':
+                raise ValueError(f'invalid_grd_inventory_checkpoint:{key}')
+            if not isinstance(requests, list) or len(requests) != 1:
+                raise ValueError(f'invalid_grd_inventory_checkpoint_requests:{key}')
+            return {
+                'inventory': copy.deepcopy(item.get('inventory')),
+                'request': copy.deepcopy(requests[0]),
+            }
+
+    def put_inventory(self, key: str, unit: dict) -> None:
+        """Fsync inventory success independently from the second GRD question."""
+        if not isinstance(unit, dict) or not isinstance(unit.get('request'), dict):
+            raise ValueError(f'invalid_grd_inventory_checkpoint_unit:{key}')
+        validate_grd_inventory(copy.deepcopy(unit.get('inventory')))
+        self.put(
+            self.inventory_key(key),
+            {'checkpoint_stage': 'inventory_v1',
+             'inventory': copy.deepcopy(unit['inventory'])},
+            [copy.deepcopy(unit['request'])],
+        )
 
     def put(self, key: str, item: dict, requests: list[dict]) -> None:
         value = (item, requests)
@@ -5898,8 +6703,14 @@ def annotate_grd_window_checkpointed(
 ) -> tuple[dict, list[dict]]:
     deferred = future_media if isinstance(future_media, DeferredMedia) else None
     try:
+        cached_inventory = checkpoint.get_inventory(key) if checkpoint is not None else None
         item, requests = annotate_grd_window(
             client, model, media, step, future_media, scope,
+            cached_inventory_unit=cached_inventory,
+            inventory_checkpoint_sink=(
+                (lambda unit: checkpoint.put_inventory(key, unit))
+                if checkpoint is not None else None
+            ),
         )
         if deferred is not None:
             future_media = deferred.resolve()
@@ -6286,6 +7097,10 @@ def align_sta_to_cpa_final(sta_result: dict, cpa_result: dict) -> dict:
                 'contact_frame_source': 'cpa_final',
                 'cpa_review_reason': str(review.get('review_reason') or ''),
             })
+            if review.get('interaction_bbox_xyxy_1000') is not None:
+                final_event['interaction_bbox_xyxy_1000'] = copy.deepcopy(
+                    review['interaction_bbox_xyxy_1000']
+                )
             proposed_observations = copy.deepcopy(
                 final_event.get('observations') or []
             )
@@ -6707,6 +7522,7 @@ def annotate_sta_random_observations(
     random_seed: int,
     workers: int,
     checkpoint: AnnotationUnitCheckpoint | None = None,
+    executor: concurrent.futures.Executor | None = None,
 ) -> tuple[dict, list[dict]]:
     """Create STA bboxes only after CPA has fixed every accepted contact frame."""
     value = copy.deepcopy(aligned_sta)
@@ -6750,22 +7566,43 @@ def annotate_sta_random_observations(
                 entry_index, sample_index, segment.get('subtask') or {},
                 event, metadata, image, checkpoint_key,
             ))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = {
-            executor.submit(
-                request_sta_observation_bbox_checkpointed,
+    # With thousands of episodes already resident, a one-worker inner lane
+    # must execute inline.  Submitting one tiny pool job from every episode
+    # queues all producer threads on ThreadPoolExecutor's process-global submit
+    # lock and leaves the provider almost idle.  Multi-worker/direct callers
+    # retain the shared/owned executor behavior.
+    if workers == 1:
+        for (
+            entry_index, sample_index, step, event, metadata, image,
+            checkpoint_key,
+        ) in jobs:
+            observation, audit = request_sta_observation_bbox_checkpointed(
                 checkpoint, checkpoint_key, client, model, step, event,
                 metadata, image,
-            ): (entry_index, sample_index)
-            for (
-                entry_index, sample_index, step, event, metadata, image,
-                checkpoint_key,
-            ) in jobs
-        }
-        for future in concurrent.futures.as_completed(pending):
-            entry_index, sample_index = pending[future]
-            observation, audit = future.result()
+            )
             completed.append((entry_index, sample_index, observation, audit))
+    else:
+        executor_context = (
+            contextlib.nullcontext(executor)
+            if executor is not None
+            else concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        )
+        with executor_context as bbox_executor:
+            pending = {
+                bbox_executor.submit(
+                    request_sta_observation_bbox_checkpointed,
+                    checkpoint, checkpoint_key, client, model, step, event,
+                    metadata, image,
+                ): (entry_index, sample_index)
+                for (
+                    entry_index, sample_index, step, event, metadata, image,
+                    checkpoint_key,
+                ) in jobs
+            }
+            for future in concurrent.futures.as_completed(pending):
+                entry_index, sample_index = pending[future]
+                observation, audit = future.result()
+                completed.append((entry_index, sample_index, observation, audit))
     audits = []
     for entry_index, _, observation, audit in sorted(completed):
         if observation is not None:
@@ -7237,6 +8074,16 @@ def _annotate_source_from_media(
         )
         commit('ecot')
     sta_cache: dict[str, tuple[dict, str]] = {}
+    reused_sta_contacts = None
+    sta_contact_index = getattr(args, 'cpa_reuse_sta_index', None)
+    if 'cpa' in needed and sta_contact_index is not None:
+        reused_sta_contacts = sta_contact_index.find(source, subtasks)
+        print(
+            f'cpa_sta_final_contact_reuse_loaded uid={source_uid} '
+            f'source_uid={reused_sta_contacts["record_uid"]} '
+            f'primary_view={str(reused_sta_contacts["primary_view"]).lower()} '
+            f'path={reused_sta_contacts["path"]}', flush=True,
+        )
     grd_checkpoint = (
         grd_checkpoint_for(args, source_uid, subtasks)
         if 'grd' in needed and subtasks is not None
@@ -7248,6 +8095,11 @@ def _annotate_source_from_media(
             args, source_uid, task, {
                 'subtask_result_sha256': sha256_json(subtasks),
                 'include_cpa_points': task == 'cpa',
+                **({
+                    'sta_final_contact_sha256': reused_sta_contacts['record_sha256'],
+                    'sta_final_contact_source_uid': reused_sta_contacts['record_uid'],
+                    'sta_final_contact_primary_view': reused_sta_contacts['primary_view'],
+                } if task == 'cpa' and reused_sta_contacts is not None else {}),
             },
         )
         for task in needed
@@ -7286,6 +8138,7 @@ def _annotate_source_from_media(
                 args.sta_lookback_seconds, args.sta_observations_per_contact,
                 args.sta_min_contact_gap_seconds, args.sta_random_seed,
                 args.sta_bbox_workers, checkpoint=sta_checkpoint,
+                executor=getattr(args.client, 'frame_executor', None),
             )
             validate_sta_cpa_contact_frame_identity(aligned_sta, cpa_result)
             if sta_checkpoint is not None:
@@ -7319,15 +8172,24 @@ def _annotate_source_from_media(
     for task in ('grd', 'sta', 'cpa'):
         if task not in needed:
             continue
-        result, requests = downstream_result(
-            task, source, media, subtasks, args.client, args.models,
-            args.sam3_snapper, args.cpa_crop_padding, args.cpa_crop_size,
-            sta_cache, args.grd_workers,
-            grd_checkpoint=grd_checkpoint,
-            unit_checkpoint=unit_checkpoints.get(task),
-            media_factory=media_factory,
-            sta_event_workers=getattr(args, 'sta_event_workers', 1),
-        )
+        if task == 'cpa' and reused_sta_contacts is not None:
+            if args.sam3_snapper is None:
+                raise RuntimeError('sam3_snapper_required_for_cpa')
+            result, requests = complete_cpa_from_sta_final(
+                reused_sta_contacts, subtasks, media, args.client, args.models,
+                args.sam3_snapper, args.cpa_crop_padding, args.cpa_crop_size,
+                unit_checkpoints.get('cpa'),
+            )
+        else:
+            result, requests = downstream_result(
+                task, source, media, subtasks, args.client, args.models,
+                args.sam3_snapper, args.cpa_crop_padding, args.cpa_crop_size,
+                sta_cache, args.grd_workers,
+                grd_checkpoint=grd_checkpoint,
+                unit_checkpoint=unit_checkpoints.get(task),
+                media_factory=media_factory,
+                sta_event_workers=getattr(args, 'sta_event_workers', 1),
+            )
         if task == 'cpa' and getattr(args, 'cpa_student_questions', False):
             from cpa_downstream import complete_source_cpa
             result = complete_source_cpa(source, media, result, args)
@@ -7533,9 +8395,19 @@ def compatible_annotation_uid(
         uid = str(record['provenance']['input_record_uid'])
     except (KeyError, TypeError):
         return None
+    recorded_model = extension.get('model')
+    model_is_compatible = recorded_model == model
+    # During the production migration from Seed 2.0 Lite to Seed 2.1 Turbo,
+    # retain already-valid STA rows instead of billing the same episode again.
+    # New rows still record the actual Turbo model in provenance.
+    if task == 'sta' and model == 'doubao-seed-2-1-turbo-260628':
+        model_is_compatible = recorded_model in {
+            'doubao-seed-2-0-lite-260215',
+            'doubao-seed-2-1-turbo-260628',
+        }
     if not uid or not (
         extension.get('annotation_task') == task
-        and extension.get('model') == model
+        and model_is_compatible
         and extension.get('provider') == provider
         and annotation.get('contract_id') in (
             ({TASK_CONTRACT_IDS['ecot']} | LEGACY_ECOT_CONTRACT_IDS)
@@ -7715,15 +8587,26 @@ def process_batch(
         )
     paths = {task: args.output/task/'shards'/source_key/f'{label}.jsonl' for task in args.tasks}
     immutable = getattr(args, 'immutable_jsonl', False)
+    skip_destination_scan = bool(
+        immutable and getattr(args, 'skip_destination_resume_scan', False)
+    )
     completed = {}
     for task, path in paths.items():
         if check_pipeline is not None:
             check_pipeline()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        completed[task] = prior_completed_uids(
-            getattr(args, 'resume_output', []), task, source_key, label,
-            args.models[task], annotation_provider(args, task),
+        if not immutable:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        trusted_completed_scope = bool(
+            getattr(args, '_trusted_completed_uid_scope', False)
         )
+        completed[task] = set(
+            getattr(args, '_global_prior_completed', {}).get(task, set())
+        )
+        if not trusted_completed_scope:
+            completed[task].update(prior_completed_uids(
+                getattr(args, 'resume_output', []), task, source_key, label,
+                args.models[task], annotation_provider(args, task),
+            ))
         locally_durable = pending_final_uids(path)
         completed[task].update(locally_durable)
         if locally_durable:
@@ -7744,7 +8627,24 @@ def process_batch(
                   f'compatible_episodes={len(completed[task])}', flush=True)
         # Read both layouts regardless of the chosen write mode, including
         # restart/fallback runs that switch back to the legacy writer.
-        candidates = [path] + sorted(path.with_suffix('.records').glob('*.jsonl'))
+        candidates = (
+            [] if trusted_completed_scope or skip_destination_scan else
+            [path] + sorted(path.with_suffix('.records').glob('*.jsonl'))
+        )
+        if skip_destination_scan:
+            print(
+                f'destination_resume_scan_skipped task={task} batch={label} '
+                f'local_resume_completed={len(completed[task])} '
+                'direct_cos_output=true',
+                flush=True,
+            )
+        if trusted_completed_scope:
+            print(
+                f'trusted_completed_scope task={task} batch={label} '
+                f'global_completed={len(completed[task])} '
+                'destination_rescan=false',
+                flush=True,
+            )
         isolated_validated = 0
         for candidate in candidates:
             if check_pipeline is not None:
@@ -7775,7 +8675,11 @@ def process_batch(
                if not immutable else {})
     error_label = (f'{label}.{next(iter(args.tasks))}'
                    if getattr(args, 'independent_stage_pipeline', False) else label)
-    error_path = args.output/'errors'/'pipeline'/source_key/f'{error_label}.jsonl'
+    error_root = (
+        args.runtime_state_dir/'errors'
+        if skip_destination_scan else args.output/'errors'
+    )
+    error_path = error_root/'pipeline'/source_key/f'{error_label}.jsonl'
     error_path.parent.mkdir(parents=True, exist_ok=True)
     repair_partial_jsonl_tail(error_path)
     if getattr(args, 'prioritize_failed_records', False):
@@ -7909,12 +8813,29 @@ def process_batch(
                         options['frame_cache_write_through'] = False
                         options['frame_cache_memory_mib'] = 256
                         options['teacher_only'] = timestamp_las_target
+                        options['teacher_source_direct'] = (
+                            timestamp_las_target and args.ecot_las_source_video_direct
+                        )
+                        if options['teacher_source_direct']:
+                            duration_hint = job[2].get('_duration_seconds')
+                            if not isinstance(duration_hint, (int, float)) or duration_hint <= 0:
+                                indexed_subtasks = args.subtask_index.find(job[2])
+                                ends = [
+                                    step.get('end_time_seconds')
+                                    for step in (indexed_subtasks or {}).get('subtasks', [])
+                                    if isinstance(step, dict)
+                                    and isinstance(step.get('end_time_seconds'), (int, float))
+                                    and step.get('end_time_seconds') > 0
+                                ]
+                                duration_hint = max(ends, default=None)
+                            options['source_duration_seconds'] = duration_hint
                     elif lane == 'grd':
                         # Hundreds of resident GRD episodes otherwise reserve
                         # up to 64 MiB each and hit the 48 GiB process address
                         # ceiling while frames are decoded. Spill older JPEGs
                         # to the local cache after a small hot working set.
                         options['frame_cache_memory_mib'] = 16
+                        options['frame_grid_only'] = True
                     prepare_started = time.monotonic()
                     with EcotMediaFactory(media, **options) as factory:
                         grid_ready = time.monotonic()
@@ -7948,7 +8869,11 @@ def process_batch(
                         job[2], job[3], input_locator, job[1], config,
                     )
                 def ready(job):
-                    return lane == 'ecot' or args.subtask_index.find(job[2]) is not None
+                    return (
+                        lane == 'ecot'
+                        or args.subtask_index.find(job[2]) is not None
+                        or args.subtask_index.is_sealed()
+                    )
                 deferred = run_prepared_jobs(
                     jobs(), args.stage_pipeline, lane, prepare, prepared_downstream,
                     finish, ready, getattr(args, 'pipeline_check', args.client.ensure_available), args.max_pending,
@@ -8021,6 +8946,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Task-scoped control/status directory; annotation paths remain unchanged.')
     parser.add_argument('--resume-output', type=Path, action='append', default=[],
                         help='Read-only prior native output root; skip compatible completed episodes')
+    parser.add_argument(
+        '--cpa-reuse-sta-output', type=Path, action='append', default=[],
+        help=(
+            'CPA-only: read CPA-final contact events from immutable STA v5 records. '
+            'Primary views reuse the final frame and interaction bbox; other views '
+            'reuse event time, remap it to the target video, and request only a new bbox.'
+        ),
+    )
     parser.add_argument('--ecot-reuse-output', nargs=3, action='append', default=[],
                         metavar=('ROOT', 'PROVIDER', 'MODEL'),
                         help='ECoT-only: reuse validated final episodes under their original provider/model; '
@@ -8050,6 +8983,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--tasks', default=','.join(TASK_ORDER))
     parser.add_argument('--ecot-video-transport', choices=('inline', 'dashscope-temporary', 'ark-files', 'cos-presigned'),
                         default='inline', help='Opt-in model-bound, 48-hour DashScope temporary video URLs')
+    parser.add_argument('--ecot-las-source-video-direct', action='store_true',
+                        help='Upload the complete source and let LAS apply the authoritative 0.5 FPS ECoT sampling')
     parser.add_argument('--ecot-image-transport', choices=('inline', 'dashscope-temporary', 'ark-files', 'cos-presigned'),
                         default='inline', help='Send ECoT target images through the same temporary storage method')
     parser.add_argument('--ark-file-cache', type=Path,
@@ -8063,6 +8998,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Run paced getPolicy HTTP in private child processes, preserving upload bytes and retry limits')
     parser.add_argument('--resume-validation-workers', type=int, default=0,
                         help='Opt-in read-only child workers for fully validated existing output files (0..32)')
+    parser.add_argument(
+        '--skip-destination-resume-scan', action='store_true',
+        help=(
+            'Trust explicit local --resume-output snapshots and the local final WAL; '
+            'do not stat the destination COS FUSE tree during immutable startup.'
+        ),
+    )
     parser.add_argument('--dashscope-server-wait-seconds', type=int, default=0,
                         help='Opt-in server burst queue (0..120 seconds) and request-local transient backoff')
     parser.add_argument('--video-prepare-codec-threads', type=int, default=1,
@@ -8247,7 +9189,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--grounding-model', dest='grd_model')
     parser.add_argument('--grd-review-endpoint', default=DEFAULT_ENDPOINTS['ark'])
     parser.add_argument('--grd-review-api-key-env', default='ARK_API_KEY')
-    parser.add_argument('--grd-review-model', choices=(GRD_REVIEW_MODEL, 'qwen3.8-max'), default=GRD_REVIEW_MODEL)
+    parser.add_argument(
+        '--grd-review-model', choices=tuple(REVIEW_PROVIDERS),
+        default=GRD_REVIEW_MODEL,
+    )
     parser.add_argument('--grd-review-api', choices=('ark', 'las', 'dashscope'), default='ark')
     parser.add_argument('--ecot-model')
     parser.add_argument('--sta-model')
@@ -8283,8 +9228,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--cpa-point-model')
     parser.add_argument('--cpa-point-backend', choices=('las', 'vlm'), default='las',
                         help='Initial contact points: LAS operator defaults, or legacy VLM for comparison')
-    parser.add_argument('--cpa-las-cos-prefix', default=os.environ.get('CPA_LAS_COS_PREFIX'),
-                        help='COS prefix used to publish CPA contact images for LAS')
     parser.add_argument('--cpa-semantic-review', action=argparse.BooleanOptionalAction,
                         default=True, help='Audit final SAM points with thinking-enabled Ark Seed 2.1 Turbo')
     parser.add_argument('--cpa-student-questions', action=argparse.BooleanOptionalAction,
@@ -8297,10 +9240,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Include robot gripper contact points along with object points')
     parser.add_argument('--cpa-crop-padding', type=float, default=0.15)
     parser.add_argument('--cpa-crop-size', type=int, default=1024)
-    parser.add_argument('--sam3-repo', type=Path, default=DEFAULT_SAM3_REPO)
+    parser.add_argument('--sam3-repo', type=Path, default=Path('/mnt/SAM3/repo'))
     parser.add_argument(
         '--sam3-checkpoint', type=Path,
-        default=DEFAULT_SAM3_CHECKPOINT,
+        default=Path('/mnt/SAM3/checkpoints/sam3.pt'),
     )
     parser.add_argument('--sam3-device', default='cuda')
     parser.add_argument('--sam3-confidence-threshold', type=float, default=0.25)
@@ -8363,26 +9306,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.checkpoint_local_batch_size != 1 and args.checkpoint_spool_root is None:
         parser.error('--checkpoint-local-batch-size requires --checkpoint-spool-root')
     if args.durable_cloud_transport == 'cos-direct' and not (
-            args.api in {'ark', 'las'} and args.tasks == 'ecot'
-            and args.checkpoint_spool_root is not None
+            args.api in {'ark', 'las'} and args.tasks in {'ecot', 'grd', 'sta', 'cpa'}
             and args.final_publication_spool_root is not None
-            and (args.dry_run or (
-                os.environ.get('VQA_COS_MOUNT_ROOT')
-                and args.output.absolute().is_relative_to(
-                    Path(os.environ['VQA_COS_MOUNT_ROOT']).absolute()
+            and (args.dry_run or any(
+                args.output.absolute().is_relative_to(root)
+                for root in (
+                    Path('/mnt/human_data/video_cleaning'),
+                    Path('/mnt/human_data/video-cleaning'),
                 )
             ))):
-        parser.error('direct COS durable output requires Volc ECoT, both local outboxes, and the writable COS mount')
+        parser.error('direct COS durable output requires a Volc downstream task, a local final outbox, and the writable COS mount')
     if ('ark-files' in (args.ecot_video_transport, args.ecot_image_transport)
             or 'cos-presigned' in (args.ecot_video_transport, args.ecot_image_transport)) and not (
             args.api in {'ark', 'las'} and args.tasks == 'ecot'
             and args.ecot_video_transport in ('ark-files', 'cos-presigned')
             and args.ecot_image_transport in ('ark-files', 'cos-presigned')):
         parser.error('Volc ECoT URL media requires Files or COS-presigned video and image inputs')
-    if not 1 <= args.ark_upload_workers <= 512:
-        parser.error('--ark-upload-workers must be between 1 and 512')
+    if not 1 <= args.ark_upload_workers <= 4096:
+        parser.error('--ark-upload-workers must be between 1 and 4096')
     if args.ecot_video_transport == 'dashscope-temporary' and args.api != 'dashscope':
         parser.error('--ecot-video-transport dashscope-temporary requires --api dashscope')
+    if args.ecot_las_source_video_direct and not (
+            args.api == 'las' and args.tasks == 'ecot'
+            and args.ecot_video_transport == 'cos-presigned'):
+        parser.error('--ecot-las-source-video-direct requires LAS cos-presigned ECoT')
     if args.ecot_image_transport == 'dashscope-temporary' and args.ecot_video_transport != 'dashscope-temporary':
         parser.error('--ecot-image-transport dashscope-temporary requires --ecot-video-transport dashscope-temporary')
     if not 0 < args.dashscope_upload_policy_qps <= 90:
@@ -8435,9 +9382,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error('invalid_stage_or_media_prefetch_limit')
     if args.independent_stage_pipeline and (
         not args.request_parallel or not args.follow_subtask_path
-        or not args.immutable_jsonl or not args.tasks <= {'ecot', 'grd'}
+        or not args.immutable_jsonl or not args.tasks <= {'ecot', 'grd', 'sta'}
     ):
-        parser.error('independent_stage_pipeline_requires_external_subtasks_immutable_ecot_grd')
+        parser.error('independent_stage_pipeline_requires_external_subtasks_immutable_ecot_grd_sta')
     args.temporal_media_types = {
         item.strip().lower()
         for item in args.temporal_media_types.split(',') if item.strip()
@@ -8550,18 +9497,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error('--cpa-crop-size must be at least 64')
     if not 0 < args.sam3_confidence_threshold <= 1:
         parser.error('--sam3-confidence-threshold must be in (0, 1]')
-    args.output = args.output.resolve()
+    # Output is commonly a COS FUSE mount. Path.resolve() walks and stats its
+    # components, which can sleep uninterruptibly in the FUSE request path
+    # before any annotation request is scheduled. The CLI path is already
+    # absolute in production; absolute() supplies the same lexical identity
+    # without touching the remote filesystem.
+    args.output = args.output.absolute()
     from task_process_state import state_directory
     if args.runtime_state_dir is not None:
-        if len(args.tasks) != 1 or next(iter(args.tasks)) not in {'ecot', 'grd', 'sta'}:
+        if len(args.tasks) != 1 or next(iter(args.tasks)) not in {'ecot', 'grd', 'sta', 'cpa'}:
             parser.error('runtime-state-dir requires exactly one downstream task')
-        expected_state = state_directory(args.output, next(iter(args.tasks)))
-        if args.runtime_state_dir.resolve() != expected_state:
-            parser.error('runtime-state-dir must be OUTPUT/_state/processes/TASK')
-        args.runtime_state_dir = expected_state
+        # Runtime state is launcher-owned control data, not annotation output.
+        # Allow every independent downstream task to place it on local XFS;
+        # forcing GRD/STA under a COS FUSE output root can block scheduling and
+        # leave thousands of otherwise usable request slots idle.
+        if not args.runtime_state_dir.is_absolute():
+            parser.error('runtime-state-dir must be absolute')
+        args.runtime_state_dir = args.runtime_state_dir.resolve()
     else:
         args.runtime_state_dir = args.output/'_state'
-    args.resume_output = [root.resolve() for root in args.resume_output]
+    args.resume_output = [root.absolute() for root in args.resume_output]
+    args.cpa_reuse_sta_output = [root.absolute() for root in args.cpa_reuse_sta_output]
+    if args.cpa_reuse_sta_output and 'cpa' not in args.tasks:
+        parser.error('--cpa-reuse-sta-output requires the cpa task')
+    for root in args.cpa_reuse_sta_output:
+        task_root = root if root.name == 'sta' else root/'sta'
+        if not task_root.is_dir():
+            parser.error(f'--cpa-reuse-sta-output has no STA task directory: {root}')
+    if args.cpa_reuse_sta_output:
+        from sta_contact_reuse import StaFinalContactIndex
+        args.cpa_reuse_sta_index = StaFinalContactIndex(args.cpa_reuse_sta_output)
+    else:
+        args.cpa_reuse_sta_index = None
     from ecot_prior_results import parse_sources as parse_ecot_reuse_sources
     try:
         args.ecot_reuse_sources = parse_ecot_reuse_sources(
@@ -8574,6 +9541,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for root in args.resume_output:
         if not root.is_dir() or root == args.output:
             parser.error('--resume-output must be an existing directory distinct from --output')
+    if args.skip_destination_resume_scan and (
+            not args.immutable_jsonl or not args.resume_output
+            or args.durable_cloud_transport != 'cos-direct'
+            or args.final_publication_spool_root is None):
+        parser.error(
+            '--skip-destination-resume-scan requires immutable JSONL, an explicit '
+            'local --resume-output, direct COS output, and a final-record spool'
+        )
     args.grd_checkpoint_root = (
         args.grd_checkpoint_root.resolve()
         if args.grd_checkpoint_root is not None
@@ -8802,26 +9777,24 @@ def main(argv: list[str] | None = None) -> None:
                 durable_jsonl.check_checkpoint_storage_health()
             except RuntimeError as error:
                 raise FatalProviderError(str(error)) from error
-        if args.fair_http_control or args.las_transport_control or 'cpa' in args.tasks:
-            from fair_request_admission import CachedAvailabilityCheck
-            native_ecot_checks = (args.api in {'ark', 'las'} and args.tasks == {'ecot'}
-                                  and args.ecot_video_transport in ('ark-files', 'cos-presigned')
-                                  and args.independent_stage_pipeline)
-            args.request_admission.check_available = CachedAvailabilityCheck(
-                check_request_provider, notification_backend='auto' if native_ecot_checks else 'private-locks')
-            args.request_admission.availability_checker = args.request_admission.check_available
-        else:
-            args.request_admission.check_available = check_request_provider
+        # Every admission path can have thousands of callers.  Directly
+        # running Path.exists()/checkpoint health checks from every caller
+        # creates a stat/GIL storm on mounted output filesystems and prevents
+        # GRD/STA requests from reaching HTTP.  Coalesce all paths, not only
+        # the fair ECoT transport.  A one-second cache preserves prompt fatal
+        # stop propagation while reducing checks from O(requests) to O(time).
+        from fair_request_admission import CachedAvailabilityCheck
+        args.request_admission.check_available = CachedAvailabilityCheck(
+            check_request_provider, interval=1, notification_backend='auto',
+        )
+        args.request_admission.availability_checker = args.request_admission.check_available
     args.video_prepare_limiter = (threading.BoundedSemaphore(args.video_prepare_workers)
                                   if args.request_parallel else None)
     args.client = ApiClient(args) if api_tasks else None
     if 'cpa' in args.tasks and args.cpa_point_backend == 'las':
         from cpa_las_points import LasContactPointSelector
-        if not args.cpa_las_cos_prefix:
-            raise SystemExit('missing_required_configuration:CPA_LAS_COS_PREFIX')
         args.client.cpa_las_selector = LasContactPointSelector(
-            args.output/'_state'/'las-contact-grounding',
-            cos_prefix=args.cpa_las_cos_prefix, coscli=args.las_coscli,
+            args.runtime_state_dir/'las-contact-grounding', coscli=args.las_coscli,
             check_available=args.client.ensure_available,
             request_admission=args.request_admission,
         )
@@ -8843,6 +9816,21 @@ def main(argv: list[str] | None = None) -> None:
         review_args.api = args.grd_review_api
         review_args.endpoint = args.grd_review_endpoint
         review_args.api_key_env = args.grd_review_api_key_env
+        if review_args.api == 'las':
+            # A current-frame review has to be wrapped as a tiny MP4 for the
+            # LAS video operator.  Reusing the main GRD publisher would allow
+            # hundreds of ffmpeg/OpenCV encoders to start at once when a large
+            # inventory cohort completes, exhausting PID/CPU capacity before
+            # the requests reach LAS.  Give reviews their own bounded media
+            # publisher; request concurrency remains independently high after
+            # the short local encoding/upload phase.
+            review_args._las_operator_media_publisher = None
+            review_args.ark_upload_workers = max(1, int(os.environ.get(
+                'VQA_GRD_REVIEW_LAS_MEDIA_WORKERS', '16',
+            )))
+            review_args.runtime_state_dir = (
+                args.runtime_state_dir / 'grd-review-las-runtime'
+            )
         review_args.fatal_stop_file = args.runtime_state_dir/'grd-review-fatal-stop.json'
         review_args.rate_state_file = args.runtime_state_dir/'grd-review-rate-state.json'
         if args.request_parallel:
@@ -8850,7 +9838,8 @@ def main(argv: list[str] | None = None) -> None:
         review_client = ApiClient(review_args)
         review_client.ensure_available()
         args.client.inventory_reviewer = InventoryReviewer(
-            review_client, args.output/'_state'/'grd-inventory-reviews', model=args.grd_review_model,
+            review_client, args.runtime_state_dir/'grd-inventory-reviews',
+            model=args.grd_review_model,
         )
     if 'subtask' in args.tasks:
         if not os.environ.get('LAS_API_KEY', '').strip():
@@ -9097,8 +10086,13 @@ def main(argv: list[str] | None = None) -> None:
         max_files=args.final_publication_spool_max_files,
         local_batch_size=args.final_publication_local_batch_size,
         writer=(durable_cloud_publisher.write_one if durable_cloud_publisher else None),
+        # STA is consumed online by CPA through the deterministic per-UID
+        # object path.  A packed upload changes that physical path while the
+        # publication ledger still records the logical per-UID path, causing
+        # CPA to accept a UID that it cannot fetch.  Keep individual immutable
+        # objects for STA; terminal tasks may still use compact packs.
         batch_writer=(durable_cloud_publisher.write_final_record_batch
-                      if durable_cloud_publisher else None),
+                      if durable_cloud_publisher and 'sta' not in args.tasks else None),
     )
     stage_context = (StagePipeline(
         args.tasks, args.max_record_active, args.video_prepare_workers, args.stage_prefetch,
@@ -9111,10 +10105,12 @@ def main(argv: list[str] | None = None) -> None:
     resume_context = (ResumeValidationPool(args.resume_validation_workers)
                       if args.resume_validation_workers else contextlib.nullcontext(None))
     availability_checker = getattr(args.request_admission, 'availability_checker', None)
+    # Keep the shared availability snapshot fresh for every independent Ark/LAS
+    # lane.  Previously this background refresh was limited to URL-based ECoT,
+    # leaving GRD/STA request threads to form a once-per-second refresh convoy.
     availability_context = (availability_checker.refreshing()
-        if availability_checker is not None and args.api in {'ark', 'las'} and args.tasks == {'ecot'}
-        and args.ecot_video_transport in ('ark-files', 'cos-presigned') and args.independent_stage_pipeline
-        else contextlib.nullcontext(None))
+        if availability_checker is not None and args.api in {'ark', 'las'}
+        and args.independent_stage_pipeline else contextlib.nullcontext(None))
     with publication_context, storage_context, final_storage_context, availability_context, video_clip_execution(args.video_clip_workers, args.video_clip_process_pool), prefetch_context as media_prefetch, metrics_context, shared_frame_context as shared_frames, grd_frame_context as grd_frames, stage_context as stage_runtime, las_context as las_executor, resume_context as resume_validator:
         if resume_validator is not None:
             resume_validator.prewarm()
@@ -9187,7 +10183,10 @@ def main(argv: list[str] | None = None) -> None:
                 record_status(batch, status)
     print(f'run_complete totals={json_dumps(totals)}', flush=True)
     if totals['errors']:
-        raise SystemExit(1)
+        # Distinguish a fully traversed scope with durable per-record errors
+        # from a process/provider crash. Fleet supervisors must not replay every
+        # failed record forever after all healthy work has been committed.
+        raise SystemExit(10)
 
 
 if __name__ == '__main__':

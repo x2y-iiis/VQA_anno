@@ -31,8 +31,11 @@ ADAPTER_VERSION = "unified-las-subtask-adapter/v2"
 DEFAULT_LAS_MODEL = "doubao-seed-2-1-pro-260628"
 DEFAULT_LAS_STEP1_MODEL = DEFAULT_LAS_MODEL
 DEFAULT_LAS_POSTPROCESS_MODEL = "doubao-seed-2-0-lite-260428"
-DEFAULT_LAS_COS_URI_PREFIX = os.environ.get("LAS_COS_URI_PREFIX")
-DEFAULT_COSCLI = os.environ.get("LAS_COSCLI", "coscli")
+DEFAULT_LAS_COS_URI_PREFIX = (
+    "cos://datasets-1409717487/video-cleaning/"
+    "vqa-subtask-grd-sta-cpa-las-inputs"
+)
+DEFAULT_COSCLI = "/root/coscli"
 DEFAULT_SIGNED_URL_SECONDS = 7 * 24 * 3600
 
 

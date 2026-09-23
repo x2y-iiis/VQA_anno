@@ -21,9 +21,9 @@ LAS 高并发模板：`scripts/run_las_high_concurrency.sh`
 |---|---|---|
 | Subtask | vendored `doubao_las_annotation` 对完整视频切分；相邻且时间连续、规范化 skill 与 description 均相同的段会合并 | Step 1/3: `doubao-seed-2-1-pro-260628`；英文后处理: `doubao-seed-2-0-lite-260428` |
 | ECoT | 在 2 FPS 目标网格上默认每 4 帧选一个目标，即每 2 秒一条；teacher 是完整 0.5 FPS episode 视频 | `doubao-seed-2-0-lite-260215` |
-| GRD | 标注 2 FPS 网格的每一帧；当前帧 inventory 最多 4 个物体；只有首个操作物体选择会看 3 FPS × 4 秒未来视频 | `doubao-seed-2-0-pro-260215` |
+| GRD | 标注 2 FPS 网格的每一帧；当前帧 inventory 最多 4 个物体；只有首个操作物体选择会看 3 FPS × 4 秒未来视频 | `doubao-seed-2-1-pro-260628` |
 | STA | 使用 CPA 审核并精确选定的最终接触帧；从此前且无其他最终接触的窗口随机取帧，给出事件名后框目标并计算 TTC | `doubao-seed-2-0-lite-260215` |
-| CPA | 审核事件、选择精确接触帧；在扩大 15% 的 bbox crop 中选点，先吸附到 crop SAM3 mask，再映射回原图并二次吸附 | `doubao-seed-2-0-pro-260215` |
+| CPA | 审核事件、选择精确接触帧；在扩大 15% 的 bbox crop 中选点，先吸附到 crop SAM3 mask，再映射回原图并二次吸附 | `doubao-seed-2-1-pro-260628` |
 
 GRD inventory 的“审核 → 必要时改名 → 再审核”默认使用
 `doubao-seed-2-1-pro-260628`。修正只能调整歧义物体的 `name` 和
@@ -50,7 +50,7 @@ Submit 的核心字段为：
   "operator_id": "las_long_video_understand",
   "operator_version": "v1",
   "data": {
-    "video_url": "https://<private-cos-object>?<temporary-signature>",
+    "video_url": "https://<bucket>.tos-cn-beijing.volces.com/<key>?X-Tos-Policy=...",
     "query": "<prompt>",
     "fps": 0.5,
     "model_name": "doubao-seed-2-0-lite-260215",
@@ -60,7 +60,10 @@ Submit 的核心字段为：
 ```
 
 LAS 鉴权使用 `LAS_API_KEY`，算子内部调用客户方舟服务使用 `ARK_API_KEY`。
-媒体先上传到私有 COS，再生成短期签名 HTTPS URL；签名 URL 和密钥不会写入最终记录或日志。
+媒体先上传到私有 TOS，默认用同时支持 GET/HEAD 的 Policy Presigned HTTPS URL 提交；
+仅当 LAS 身份已有 TOS 直读权限时才改用原生 `tos://<bucket>/<key>` URI。LAS 任务进入终态后
+上传器会删除对象；还应为该前缀设置短生命周期，以清理进程异常退出时残留的对象。
+密钥不会写入最终记录或日志。
 
 - ECoT：上传一份完整 0.5 FPS teacher 视频；每个目标请求只复用同一视频 URL，并用精确时间戳和 teacher 帧序号定位目标，不再逐目标上传 JPEG，也不再为每一帧重新拼接视频。
 - GRD/STA：单图、未来片段或接触片段会按算子要求编码成 MP4，再通过 `video_url` 提交。
@@ -162,10 +165,10 @@ PYTHONPATH=scripts python scripts/native_ecot_gate.py --build
 LAS customer-Ark 模式至少需要：
 
 - `LAS_API_KEY` 与 `ARK_API_KEY`；
-- 已登录且可执行的 `coscli`；
-- `VQA_COS_BUCKET`、`VQA_COS_ENDPOINT`、`VQA_COS_REGION`；
-- `VQA_LAS_OPERATOR_VIDEO_PREFIX`，以及 ECoT 的 `VQA_COS_VIDEO_PREFIX`；
-- 如使用 LAS CPA 选点，还需 `CPA_LAS_COS_PREFIX`。
+- Python 包 `tos>=2.9,<3`；
+- `TOS_ACCESS_KEY`、`TOS_SECRET_KEY`、`TOS_BUCKET`，地域、Endpoint 和前缀见
+  `configs/tos.env.example`；
+- 上传身份对该前缀具有写入/删除权限，LAS 对同一前缀具有读取权限。
 
 SAM3/CoTracker 不随仓库分发，通过 `SAM3_REPO`、`SAM3_CHECKPOINT`、
 `COTRACKER_REPO`、`COTRACKER_CHECKPOINT` 配置。

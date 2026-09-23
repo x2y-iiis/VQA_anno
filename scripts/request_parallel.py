@@ -11,14 +11,55 @@ from pathlib import Path
 
 
 class RequestAdmission:
-    """FIFO admission before serialization, bounded by count and working bytes."""
+    """FIFO admission before serialization, bounded by count and working bytes.
+
+    Waiters use directed events instead of ``Condition.notify_all``.  The old
+    broadcast implementation woke thousands of non-head FIFO waiters for every
+    grant/release.  Under large STA runs that produced quadratic lock/GIL
+    contention while most of the configured byte budget remained unused.
+    """
     def __init__(self, maximum=256, byte_budget=12*1024**3):
         self.maximum = maximum
         self.byte_budget = byte_budget
         self.active = self.peak_active = self.bytes = self.peak_bytes = 0
         self.by_task = {}
         self.waiters = deque()
-        self.condition = threading.Condition()
+        self.condition = threading.Condition(threading.Lock())
+
+    def _grant_waiters_locked(self):
+        """Reserve every currently available permit before waking its owner.
+
+        Waking only the FIFO head made a large fleet refill one OS thread at a
+        time.  With thousands of waiters, the next thread could remain
+        descheduled long enough for an 8k-wide gate to drain to a few hundred
+        active requests despite ample memory and provider capacity.  Assigning
+        permits while holding the queue lock keeps FIFO and byte accounting
+        exact, but removes that scheduler-dependent hand-off chain.
+        """
+        while self.waiters and self.active < self.maximum:
+            ticket = self.waiters[0]
+            weight = ticket['weight']
+            if self.bytes + weight > self.byte_budget:
+                break
+            self.waiters.popleft()
+            ticket['granted'] = True
+            self.active += 1
+            self.bytes += weight
+            task = ticket['task']
+            self.by_task[task] = self.by_task.get(task, 0) + 1
+            self.peak_active = max(self.active, self.peak_active)
+            self.peak_bytes = max(self.bytes, self.peak_bytes)
+            ticket['event'].set()
+
+    def _release_grant_locked(self, ticket):
+        if not ticket['granted']:
+            return
+        ticket['granted'] = False
+        self.active -= 1
+        self.bytes -= ticket['weight']
+        task = ticket['task']
+        self.by_task[task] -= 1
+        self._grant_waiters_locked()
 
     @contextmanager
     def admit(self, task, weight=0):
@@ -28,41 +69,38 @@ class RequestAdmission:
         weight = max(0, int(weight))
         if weight > self.byte_budget:
             raise ValueError('single_request_exceeds_working_memory_budget')
-        ticket = object()
+        ticket = {
+            'event': threading.Event(),
+            'task': task,
+            'weight': weight,
+            'granted': False,
+        }
         with self.condition:
             self.waiters.append(ticket)
+            self._grant_waiters_locked()
         try:
-            while True:
+            while not ticket['event'].wait(timeout=1):
                 # Storage/provider checks must never hold the shared gate lock.
                 if check is not None:
                     check()
-                with self.condition:
-                    if (self.waiters[0] is ticket and self.active < self.maximum
-                            and self.bytes + weight <= self.byte_budget):
-                        self.waiters.popleft()
-                        self.active += 1
-                        self.bytes += weight
-                        self.peak_active = max(self.active, self.peak_active)
-                        self.peak_bytes = max(self.bytes, self.peak_bytes)
-                        self.by_task[task] = self.by_task.get(task, 0) + 1
-                        self.condition.notify_all()
-                        break
-                    self.condition.wait(timeout=1)
-        except BaseException:
-            with self.condition:
-                self.waiters.remove(ticket)
-                self.condition.notify_all()
-            raise
-        try:
             if check is not None:
                 check()
+        except BaseException:
+            with self.condition:
+                if ticket['granted']:
+                    self._release_grant_locked(ticket)
+                else:
+                    try:
+                        self.waiters.remove(ticket)
+                    except ValueError:
+                        pass
+                    self._grant_waiters_locked()
+            raise
+        try:
             yield
         finally:
             with self.condition:
-                self.active -= 1
-                self.bytes -= weight
-                self.by_task[task] -= 1
-                self.condition.notify_all()
+                self._release_grant_locked(ticket)
 
     def snapshot(self):
         with self.condition:

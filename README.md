@@ -24,9 +24,9 @@ refreshed on 2026-09-16.
 |---|---|---|
 | Subtask | Whole-video segmentation through vendored `doubao_las_annotation`; merge adjacent, contiguous segments only when normalized skill and description both match | `doubao-seed-2-1-pro-260628`; English postprocess `doubao-seed-2-0-lite-260428` |
 | ECoT | Targets live on a 2 FPS grid and default to every fourth frame; the complete teacher video is 0.5 FPS | `doubao-seed-2-0-lite-260215` |
-| GRD | Inventory every 2 FPS frame with at most four objects; only first-operated-object selection sees the 3 FPS × 4 s future clip | `doubao-seed-2-0-pro-260215` |
+| GRD | Inventory every 2 FPS frame with at most four objects; only first-operated-object selection sees the 3 FPS × 4 s future clip | `doubao-seed-2-1-pro-260628` |
 | STA | Use CPA-final contacts; sample eligible preceding frames without an intervening final contact; ground the named event and compute TTC | `doubao-seed-2-0-lite-260215` |
-| CPA | Review events, select exact contact frames, choose points in a 15%-expanded crop, then snap with SAM3 in the crop and full frame | `doubao-seed-2-0-pro-260215` |
+| CPA | Review events, select exact contact frames, choose points in a 15%-expanded crop, then snap with SAM3 in the crop and full frame | `doubao-seed-2-1-pro-260628` |
 
 GRD distinguishability review/repair/re-review defaults to
 `doubao-seed-2-1-pro-260628`. Frames that still contain ambiguous object names
@@ -44,9 +44,12 @@ https://operator.las.cn-beijing.volces.com/api/v1/poll
 
 The Submit payload uses `data.video_url`, `query`, `fps`, `model_name`, and
 `ark_api_key`. `LAS_API_KEY` authenticates LAS, while `ARK_API_KEY` is supplied
-to the operator for the customer's Ark inference. Media is stored in private COS
-objects and passed as short-lived signed HTTPS URLs; secrets and signed URLs are
-not persisted in public records or logs.
+to the operator for the customer's Ark inference. Media is uploaded to private
+TOS and passed as GET/HEAD-compatible policy-presigned HTTPS URLs by default.
+Native `tos://<bucket>/<key>` is an explicit fallback for LAS identities with
+direct TOS read permission. The uploader deletes an
+object after its LAS task becomes terminal; configure a short bucket lifecycle
+for crash leftovers. Credentials are not persisted in public records or logs.
 
 For LAS ECoT, one complete 0.5 FPS episode video is uploaded and reused. Each
 target request identifies the exact timestamp and teacher-frame index in that
@@ -99,8 +102,9 @@ PYTHONPATH=scripts python scripts/native_ecot_gate.py --build
 
 Load a populated local configuration with
 `set -a; source configs/api.env; set +a`. LAS customer-Ark mode requires
-`LAS_API_KEY`, `ARK_API_KEY`, a configured
-`coscli`, and the `VQA_COS_*` settings shown in the example file. CPA additionally
+`LAS_API_KEY`, `ARK_API_KEY`, the `tos` Python package, and the `TOS_*` settings
+shown in `configs/tos.env.example`. The upload identity needs write/delete access
+to the configured prefix, while LAS needs read access to the same objects. CPA additionally
 requires external SAM3 and CoTracker repositories/checkpoints. Large model assets
 are intentionally not vendored.
 

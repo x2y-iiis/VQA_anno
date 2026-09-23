@@ -12,7 +12,12 @@ from pathlib import Path
 import tempfile
 
 MODEL = 'doubao-seed-2-1-pro-260628'
-REVIEW_PROVIDERS = {MODEL: 'ark', 'qwen3.8-max': 'dashscope'}
+TURBO_MODEL = 'doubao-seed-2-1-turbo-260628'
+REVIEW_PROVIDERS = {
+    MODEL: 'ark',
+    TURBO_MODEL: 'ark',
+    'qwen3.8-max': 'dashscope',
+}
 POLICY = 'grd-inventory-review-repair-review/v2'
 SYSTEM = '''Audit object-name distinguishability for grounding training in ONE current image.
 The learner is asked to ground the canonical inventory name, not an object index or a box.

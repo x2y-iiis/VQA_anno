@@ -3,7 +3,6 @@
 import base64
 import hashlib
 import json
-import os
 from pathlib import Path
 import threading
 
@@ -11,10 +10,12 @@ from cos_ecot_images import BUCKET, make_client
 from http_transport_metrics import TimedOperationMetrics
 
 
-DEFAULT_MOUNT_ROOT = Path(os.environ.get('VQA_COS_MOUNT_ROOT', '/__vqa_cos_mount_not_configured__'))
-KEY_PREFIX = os.environ.get('VQA_COS_OUTPUT_PREFIX', '').strip('/')
-if KEY_PREFIX:
-    KEY_PREFIX += '/'
+DEFAULT_MOUNT_ROOT = Path('/mnt/human_data/video_cleaning')
+DEFAULT_MOUNT_ROOT_ALIASES = (
+    DEFAULT_MOUNT_ROOT,
+    Path('/mnt/human_data/video-cleaning'),
+)
+KEY_PREFIX = 'video-cleaning/'
 
 
 def fingerprint(value):
@@ -32,8 +33,13 @@ class CosOutputPublisher:
 
     def __init__(self, workers=128, client=None, mount_root=DEFAULT_MOUNT_ROOT):
         self.mount_root = Path(mount_root).absolute()
-        if client is None and not BUCKET:
-            raise RuntimeError('missing_required_configuration:VQA_COS_BUCKET')
+        # The production COSFS mount exists under both historical spellings.
+        # They address the same object namespace, so accept both only when the
+        # caller uses the production default.  Explicit test/custom roots stay
+        # restricted to the path supplied by the caller.
+        self.mount_roots = tuple(
+            root.absolute() for root in DEFAULT_MOUNT_ROOT_ALIASES
+        ) if self.mount_root == DEFAULT_MOUNT_ROOT.absolute() else (self.mount_root,)
         self.client = client if client is not None else make_client(workers)
         self.operations = TimedOperationMetrics(backend='auto')
         self.lock = threading.Lock()
@@ -41,10 +47,15 @@ class CosOutputPublisher:
 
     def key_for_path(self, path):
         absolute = Path(path).absolute()
-        try:
-            relative = absolute.relative_to(self.mount_root)
-        except ValueError as error:
-            raise ValueError('cos_output_path_outside_writable_mount') from error
+        relative = None
+        for root in self.mount_roots:
+            try:
+                relative = absolute.relative_to(root)
+                break
+            except ValueError:
+                continue
+        if relative is None:
+            raise ValueError('cos_output_path_outside_writable_mount')
         if not relative.parts or '..' in relative.parts:
             raise ValueError('cos_output_path_invalid')
         return KEY_PREFIX + relative.as_posix()

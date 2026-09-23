@@ -3,8 +3,36 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, wait
 import hashlib
 import json
+from pathlib import Path
 import threading
 import time
+
+
+_SUBTASK_INDEX_LOCK = threading.Lock()
+_SUBTASK_IMMUTABLE_INDEX = {}
+
+
+def immutable_subtask_index(root):
+    """Build one process-wide hash-to-path map independent of batch sizing."""
+    key = str(root.resolve())
+    with _SUBTASK_INDEX_LOCK:
+        cached = _SUBTASK_IMMUTABLE_INDEX.get(key)
+        if cached is not None:
+            return cached
+        started = time.monotonic()
+        index = {}
+        shard_root = root / 'shards'
+        for path in shard_root.glob('*/*.records/*.jsonl'):
+            name = path.stem
+            if len(name) == 64:
+                index[name] = str(path)
+        _SUBTASK_IMMUTABLE_INDEX[key] = index
+        print(
+            f'upstream_subtask_global_index_ready root={root} '
+            f'records={len(index)} seconds={time.monotonic()-started:.3f}',
+            flush=True,
+        )
+        return index
 
 
 @contextmanager
@@ -46,14 +74,24 @@ class FollowingSubtaskIndex:
     """Follow one upstream shard without holding the entire catalog in memory."""
     def __init__(self, root, source_key, label, pipeline):
         self.pipeline = pipeline
+        self.root = root
         self.path = root/'shards'/source_key/f'{label}.jsonl'
         self.index = pipeline.SubtaskIndex()
         self.signature = None
         self.lock = threading.Lock()
 
+    def is_sealed(self):
+        """Return whether the upstream producer declared its snapshot final."""
+        return any(self.root.glob('.complete*'))
+
     def find(self, source):
         uid = str(source['uid'])
-        immutable = self.path.with_suffix('.records')/(hashlib.sha256(uid.encode()).hexdigest()+'.jsonl')
+        digest = hashlib.sha256(uid.encode()).hexdigest()
+        immutable = self.path.with_suffix('.records')/(digest+'.jsonl')
+        if not immutable.is_file() and self.is_sealed():
+            alternate = immutable_subtask_index(self.root).get(digest)
+            if alternate is not None:
+                immutable = Path(alternate)
         if immutable.is_file():
             with immutable.open() as stream:
                 row = json.loads(stream.readline())
@@ -80,6 +118,13 @@ class FollowingSubtaskIndex:
                     print(f'upstream_subtask_ready uid={source["uid"]} '
                           f'wait_seconds={time.monotonic()-started:.1f}', flush=True)
                 return
+            # Once the producer has sealed its snapshot, an absent UID is a
+            # durable upstream rejection. Waiting forever pins a batch and used
+            # to make every fleet supervisor replay the same tail records.
+            if self.is_sealed():
+                raise FileNotFoundError(
+                    f'upstream_subtask_missing_after_complete:{source["uid"]}'
+                )
             if not announced:
                 print(f'upstream_subtask_wait uid={source["uid"]} source={self.path}', flush=True)
                 announced = True

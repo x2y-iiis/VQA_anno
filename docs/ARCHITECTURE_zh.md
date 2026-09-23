@@ -57,10 +57,10 @@ Submit 的 `data` 使用 `video_url`、`query`、`fps`、`model_name` 和 `ark_a
 | Subtask 主分析 | `doubao-seed-2-1-pro-260628` |
 | Subtask 英文后处理 | `doubao-seed-2-0-lite-260428` |
 | ECoT | `doubao-seed-2-0-lite-260215` |
-| GRD | `doubao-seed-2-0-pro-260215` |
+| GRD | `doubao-seed-2-1-pro-260628` |
 | GRD 名称审核/修复 | `doubao-seed-2-1-pro-260628` |
 | STA | `doubao-seed-2-0-lite-260215` |
-| CPA | `doubao-seed-2-0-pro-260215` |
+| CPA | `doubao-seed-2-1-pro-260628` |
 
 Ark、DashScope 和通用 OpenAI-compatible 路径仍被保留，用于小规模运行或回放已有结果。
 

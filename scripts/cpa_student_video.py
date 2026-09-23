@@ -61,8 +61,7 @@ def build_student_questions(audit: dict, observation: dict, segmentation: dict,
     import importlib.util
     from pathlib import Path
 
-    project = Path(__file__).resolve().parents[1]
-    root = Path(legacy_root or project/'third_party/robot_vqa_sta_cpa')
+    root = Path(legacy_root or '/mnt/robot_vqa_sta_cpa')
     source = root / 'src/generate_robot.py'
     spec = importlib.util.spec_from_file_location('cpa_legacy_question_builder', source)
     module = importlib.util.module_from_spec(spec)

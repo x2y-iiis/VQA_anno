@@ -20,18 +20,17 @@ from cpa_student_video import with_student_video
 VERSION = 'cpa-native-tracking-object-two-decimal/v5'
 CPA_MIN_CONTACT_GAP_SECONDS = 0.2
 CPA_MAX_CONTACT_GAP_SECONDS = 0.4
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LEGACY_SOURCE = Path(os.environ.get(
-    'CPA_LEGACY_POLICY_SOURCE',
-    PROJECT_ROOT/'third_party/robot_vqa_sta_cpa/src/generate_robot.py',
-))
+LEGACY_SOURCE = Path('/mnt/robot_vqa_sta_cpa/src/generate_robot.py')
 PIPELINE_LOCK = threading.Lock()
 PIPELINES = {}
 
 
 def complete_source_cpa(source, media, value, args):
     """Connect the production annotator to durable CPA learner records."""
-    root = Path(args.output) / '_state' / 'cpa-student-coordinates'
+    # Student tracking state is process recovery data, not a published
+    # annotation artifact.  Keeping it below the shared output made newer CPA
+    # identities collide with stale checkpoints from older fleet versions.
+    root = Path(args.runtime_state_dir) / 'cpa-student-coordinates'
     root.mkdir(parents=True, exist_ok=True)
     video_item = next(((mime,payload) for mime,payload in media if mime.startswith('video/')),None)
     if video_item is None:
@@ -128,7 +127,7 @@ class CpaDownstream:
             replicas = int(os.environ.get('CPA_TRACKER_REPLICAS', '2'))
         except (TypeError, ValueError):
             replicas = 2
-        self.tracker_replicas = max(1, min(4, replicas))
+        self.tracker_replicas = max(1, min(16, replicas))
         self.trackers = [None] * self.tracker_replicas
         self.tracker_locks = [threading.Lock() for _ in range(self.tracker_replicas)]
         self.tracker_init_lock = threading.Lock()

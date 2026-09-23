@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import threading
 import time
 
@@ -11,6 +12,35 @@ import time
 def signature(path):
     stat = Path(path).stat()
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def fast_incompatible_immutable_record(path, task, model):
+    """Reject a per-episode file with a different task/model from its header.
+
+    Immutable GRD records can be tens of megabytes because one JSON line owns
+    every frame.  The canonical top-level UID is written before those payloads
+    and already includes ``annotation:<task>:<model>``.  Reading the header is
+    sufficient to reject an older model, while matching/unknown layouts still
+    take the complete contract-validation path below.
+    """
+    path = Path(path)
+    if not path.parent.name.endswith('.records'):
+        return False
+    try:
+        with path.open('rb') as stream:
+            header = stream.read(4096)
+    except OSError:
+        return False
+    if b'"schema_version": "unified-vqa-record/v2"' not in header:
+        return False
+    match = re.search(rb'"uid"\s*:\s*("(?:[^"\\]|\\.)*")', header)
+    if match is None:
+        return False
+    try:
+        uid = json.loads(match.group(1))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return not str(uid).endswith(f':annotation:{task}:{model}')
 
 
 def validate_current_file(path, task, model, provider, require_review):
@@ -26,6 +56,12 @@ def validate_current_file(path, task, model, provider, require_review):
     path = Path(path)
     try:
         before = signature(path)
+        if fast_incompatible_immutable_record(path, task, model):
+            if before != signature(path):
+                return None
+            return {'uids': [], 'ignored_rows': 1,
+                    'signature': before, 'worker_pid': os.getpid(),
+                    'fast_header_reject': True}
         seen = set()
         ignored = 0
         with path.open('rb', buffering=4 * 1024 * 1024) as stream:

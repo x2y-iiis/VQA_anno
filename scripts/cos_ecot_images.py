@@ -3,7 +3,6 @@ from contextlib import contextmanager
 import hashlib
 import fcntl
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -14,12 +13,9 @@ import uuid
 from ark_file_transport import ArkFileReference
 from request_parallel import atomic_json
 
-BUCKET = os.environ.get('VQA_COS_BUCKET', '')
-PREFIX = os.environ.get('VQA_COS_IMAGE_PREFIX', 'vqa-annotation/ecot-target-images/').strip('/') + '/'
-VIDEO_PREFIX = os.environ.get('VQA_COS_VIDEO_PREFIX', 'vqa-annotation/ecot-videos/').strip('/') + '/'
-COS_ENDPOINT = os.environ.get('VQA_COS_ENDPOINT', 'https://cos.ap-shanghai.myqcloud.com')
-COS_REGION = os.environ.get('VQA_COS_REGION', 'ap-shanghai')
-COSCLI = os.environ.get('LAS_COSCLI', 'coscli')
+BUCKET = 'datasets-1409717487'
+PREFIX = 'video-cleaning/vqa-subtask-grd-sta-cpa-las-inputs/ecot-target-images/'
+VIDEO_PREFIX = 'video-cleaning/vqa-subtask-grd-sta-cpa-las-inputs/ecot-videos/'
 
 
 class ShardedCosClient:
@@ -41,9 +37,27 @@ class ShardedCosClient:
     def delete_object(self, **kwargs):
         return self._for_key(kwargs['Key']).delete_object(**kwargs)
 
+    def get_object(self, **kwargs):
+        return self._for_key(kwargs['Key']).get_object(**kwargs)
+
+    def list_objects_v2(self, **kwargs):
+        return self.clients[0].list_objects_v2(**kwargs)
+
     def generate_presigned_url(self, operation, *, Params, ExpiresIn):
         return self._for_key(Params['Key']).generate_presigned_url(
             operation, Params=Params, ExpiresIn=ExpiresIn)
+
+    def create_multipart_upload(self, **kwargs):
+        return self._for_key(kwargs['Key']).create_multipart_upload(**kwargs)
+
+    def upload_part_copy(self, **kwargs):
+        return self._for_key(kwargs['Key']).upload_part_copy(**kwargs)
+
+    def complete_multipart_upload(self, **kwargs):
+        return self._for_key(kwargs['Key']).complete_multipart_upload(**kwargs)
+
+    def abort_multipart_upload(self, **kwargs):
+        return self._for_key(kwargs['Key']).abort_multipart_upload(**kwargs)
 
 
 def make_client(workers):
@@ -51,7 +65,7 @@ def make_client(workers):
     from botocore.config import Config
     # Decode through the already-installed official CLI once, never per image.
     # Captured credentials must never be logged or persisted in a new file.
-    result = subprocess.run([COSCLI, 'config', 'show', '--disable-log'],
+    result = subprocess.run(['/root/coscli', 'config', 'show', '--disable-log'],
                             capture_output=True, text=True, timeout=30)
     fields = dict(re.findall(r'^[ \t]*(Secret ID|Secret Key|Session Token):[ \t]*([^\r\n]*)',
                              result.stdout, flags=re.MULTILINE))
@@ -61,13 +75,15 @@ def make_client(workers):
     # once, while each client owns a separate urllib3 pool and signing state.
     shards = min(16, max(1, (workers + 31) // 32))
     pool_size = max(1, (workers + shards - 1) // shards)
-    clients = [boto3.client('s3', endpoint_url=COS_ENDPOINT,
-        region_name=COS_REGION, aws_access_key_id=fields['Secret ID'].strip(),
+    clients = [boto3.client('s3', endpoint_url='https://cos.ap-shanghai.myqcloud.com',
+        region_name='ap-shanghai', aws_access_key_id=fields['Secret ID'].strip(),
         aws_secret_access_key=fields['Secret Key'].strip(),
         aws_session_token=fields.get('Session Token', '').strip() or None,
         config=Config(signature_version='s3', s3={'addressing_style': 'virtual'},
             max_pool_connections=pool_size, connect_timeout=20, read_timeout=90,
-            # Storage retries are cheaper than retrying a whole annotated episode.
+            # Storage retries are cheaper than retrying a whole annotated
+            # episode and protect high-concurrency uploads from transient COS
+            # SlowDown/UserNetworkTooSlow responses.
             retries={'max_attempts': 3, 'mode': 'standard'}, proxies={},
             request_checksum_calculation='when_required', response_checksum_validation='when_required'))
         for _ in range(shards)]
@@ -155,8 +171,6 @@ class CosImagePublisher:
     def __init__(self, cache_root, workers=512, client=None, check=None):
         self.root = Path(cache_root)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if client is None and not BUCKET:
-            raise RuntimeError('missing_required_configuration:VQA_COS_BUCKET')
         self.client = client if client is not None else make_client(workers)
         self.check = check or (lambda: None)
         # A Python Condition-backed semaphore convoys badly once thousands of

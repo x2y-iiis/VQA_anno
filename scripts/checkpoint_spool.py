@@ -84,6 +84,55 @@ class CheckpointSpool:
         for (path,) in self.db.execute("SELECT path FROM jobs WHERE parent=''").fetchall():
             self.db.execute('UPDATE jobs SET parent=? WHERE path=?', (str(Path(path).parent), path))
         self.db.execute('CREATE INDEX IF NOT EXISTS parent_index ON jobs(parent,retry_at)')
+        if self.path_kind == 'final-record':
+            # ``jobs`` is an outbox, not a completion ledger: successful cloud
+            # publication deletes its row.  Keep the accepted identity in the
+            # same FULL-synchronous transaction so a restart cannot forget a
+            # completed record and replay its (potentially billable) inference.
+            self.db.execute(
+                'CREATE TABLE IF NOT EXISTS accepted ('
+                'path TEXT PRIMARY KEY, parent TEXT NOT NULL, '
+                'input_record_uid TEXT NOT NULL, payload_sha256 TEXT NOT NULL, '
+                'created REAL NOT NULL)'
+            )
+            self.db.execute('CREATE INDEX IF NOT EXISTS accepted_parent_index '
+                            'ON accepted(parent,input_record_uid)')
+            # ``accepted`` is a local-WAL acknowledgement.  Keep a distinct,
+            # append-only publication ledger for records whose cloud writer
+            # returned successfully.  Downstream stages can consume this table
+            # incrementally without waiting for an unrelated, continuously
+            # busy outbox to become completely empty.
+            self.db.execute(
+                'CREATE TABLE IF NOT EXISTS published ('
+                'path TEXT PRIMARY KEY, parent TEXT NOT NULL, '
+                'input_record_uid TEXT NOT NULL, published REAL NOT NULL)'
+            )
+            self.db.execute('CREATE INDEX IF NOT EXISTS published_parent_index '
+                            'ON published(parent,input_record_uid)')
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                for path, payload, created, parent in self.db.execute(
+                        'SELECT path,payload,created,parent FROM jobs').fetchall():
+                    uid, digest = self._final_record_identity(payload)
+                    self.db.execute(
+                        'INSERT OR IGNORE INTO accepted('
+                        'path,parent,input_record_uid,payload_sha256,created) '
+                        'VALUES(?,?,?,?,?)',
+                        (path, parent, uid, digest, created),
+                    )
+                # Migration is exact: an accepted path that is absent from the
+                # durable outbox was removed only after a successful cloud
+                # write.  Pending/retrying paths remain excluded.
+                self.db.execute(
+                    'INSERT OR IGNORE INTO published(path,parent,input_record_uid,published) '
+                    'SELECT a.path,a.parent,a.input_record_uid,? FROM accepted a '
+                    'LEFT JOIN jobs j ON j.path=a.path WHERE j.path IS NULL',
+                    (time.time(),),
+                )
+                self.db.execute('COMMIT')
+            except BaseException:
+                self.db.execute('ROLLBACK')
+                raise
         directory_fd = os.open(self.root, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -109,6 +158,13 @@ class CheckpointSpool:
         heapq.heapify(self.created_heap)
         self.local_batch_size, self.local_batch_delay = local_batch_size, local_batch_delay
         self.local_queue = {}
+        self.accepted = {}
+        self.accepted_by_parent = {}
+        if self.path_kind == 'final-record':
+            for path, parent, uid, digest in self.db.execute(
+                    'SELECT path,parent,input_record_uid,payload_sha256 FROM accepted').fetchall():
+                self.accepted[path] = (uid, digest, parent)
+                self.accepted_by_parent.setdefault(parent, set()).add(uid)
         self.cloud_ack_queue = deque()
         self.local_queued_bytes = 0
         self.local_transactions = 0
@@ -147,22 +203,45 @@ class CheckpointSpool:
             raise ValueError('final_record_spool_accepts_only_immutable_stage_records')
         return str(relative)
 
+    @staticmethod
+    def _final_record_identity(payload):
+        try:
+            uid = str(json.loads(payload)['provenance']['input_record_uid'])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError('invalid_final_record_spool_payload') from error
+        return uid, hashlib.sha256(payload.encode()).hexdigest()
+
+    def _remember_accepted(self, relative, payload, created):
+        uid, digest = self._final_record_identity(payload)
+        parent = str(Path(relative).parent)
+        self.accepted[relative] = (uid, digest, parent)
+        self.accepted_by_parent.setdefault(parent, set()).add(uid)
+
     def pending_input_uids(self, shard_path):
         """Return durable final-record UIDs known before a resume scan starts."""
         if self.path_kind != 'final-record':
             raise RuntimeError('pending_input_uids_requires_final_record_spool')
         parent = str(Path(shard_path).with_suffix('.records').absolute().relative_to(self.output))
         with self.condition:
-            payloads = [job.payload for job in self.jobs.values() if job.parent == parent]
-            payloads += [ticket.payload for path, ticket in self.local_queue.items()
-                         if str(Path(path).parent) == parent]
-        result = set()
+            result = set(self.accepted_by_parent.get(parent, ()))
+            payloads = [ticket.payload for path, ticket in self.local_queue.items()
+                        if str(Path(path).parent) == parent]
         for payload in payloads:
-            try:
-                result.add(str(json.loads(payload)['provenance']['input_record_uid']))
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise RuntimeError('invalid_final_record_spool_payload') from error
+            result.add(self._final_record_identity(payload)[0])
         return result
+
+    def published_input_uids(self, shard_path=None):
+        """Return final-record UIDs acknowledged by the cloud writer."""
+        if self.path_kind != 'final-record':
+            raise RuntimeError('published_input_uids_requires_final_record_spool')
+        if shard_path is None:
+            rows = self.db.execute('SELECT input_record_uid FROM published').fetchall()
+        else:
+            parent = str(Path(shard_path).with_suffix('.records').absolute().relative_to(self.output))
+            rows = self.db.execute(
+                'SELECT input_record_uid FROM published WHERE parent=?', (parent,),
+            ).fetchall()
+        return {row[0] for row in rows}
 
     def _publish_health(self):
         # Replace one immutable snapshot while state is serialized by the
@@ -219,6 +298,12 @@ class CheckpointSpool:
                 new_rows = []
                 tickets.clear()
                 for relative, (payload, size) in prepared.items():
+                    accepted = self.accepted.get(relative)
+                    if accepted is not None:
+                        _, digest, _ = accepted
+                        if digest != hashlib.sha256(payload.encode()).hexdigest():
+                            raise ValueError('conflicting_checkpoint_spool_unit')
+                        continue
                     ticket = self.local_queue.get(relative)
                     if ticket is not None:
                         if ticket.payload != payload:
@@ -270,10 +355,22 @@ class CheckpointSpool:
 
     def _commit_single(self, relative, payload, size):
         created = time.time()
-        # In autocommit mode this statement returns only after the SQLite
-        # WAL commit is fsynced (synchronous=FULL), including after a crash.
-        self.db.execute('INSERT INTO jobs(path,payload,size,created,parent) VALUES(?,?,?,?,?)',
-                        (relative, payload, size, created, str(Path(relative).parent)))
+        parent = str(Path(relative).parent)
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            self.db.execute('INSERT INTO jobs(path,payload,size,created,parent) VALUES(?,?,?,?,?)',
+                            (relative, payload, size, created, parent))
+            if self.path_kind == 'final-record':
+                uid, digest = self._final_record_identity(payload)
+                self.db.execute(
+                    'INSERT INTO accepted(path,parent,input_record_uid,payload_sha256,created) '
+                    'VALUES(?,?,?,?,?)', (relative, parent, uid, digest, created))
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
+        if self.path_kind == 'final-record':
+            self._remember_accepted(relative, payload, created)
         self.jobs[relative] = _PendingJob(payload, size, created, str(Path(relative).parent))
         self._schedule(relative)
         self.created_by_path[relative] = created
@@ -349,6 +446,8 @@ class CheckpointSpool:
                         self.local_queued_bytes -= ticket.size
                         self.jobs[path] = _PendingJob(ticket.payload, ticket.size, ticket.created,
                                                       str(Path(path).parent))
+                        if self.path_kind == 'final-record':
+                            self._remember_accepted(path, ticket.payload, ticket.created)
                         self._schedule(path)
                         self.created_by_path[path] = ticket.created
                         heapq.heappush(self.created_heap, (ticket.created, path))
@@ -400,6 +499,17 @@ class CheckpointSpool:
                 self.db.execute('INSERT INTO jobs(path,payload,size,created,parent) VALUES '
                                 + ','.join(['(?,?,?,?,?)']*len(chunk)),
                                 tuple(value for row in values for value in row))
+                if self.path_kind == 'final-record':
+                    accepted = []
+                    for path, ticket in chunk:
+                        uid, digest = self._final_record_identity(ticket.payload)
+                        accepted.append((path, str(Path(path).parent), uid, digest, ticket.created))
+                    self.db.execute(
+                        'INSERT INTO accepted('
+                        'path,parent,input_record_uid,payload_sha256,created) VALUES '
+                        + ','.join(['(?,?,?,?,?)']*len(accepted)),
+                        tuple(value for row in accepted for value in row),
+                    )
             completed_paths = [row[0] for ack in acknowledgements
                                if ack.error_name is None for row in ack.claimed]
             self._execute_cloud_rows(completed_paths)
@@ -471,6 +581,14 @@ class CheckpointSpool:
             chunk = paths[offset:offset+128]
             placeholders = ','.join(['?']*len(chunk))
             if retry_at is None:
+                if self.path_kind == 'final-record':
+                    self.db.execute(
+                        'INSERT OR IGNORE INTO published('
+                        'path,parent,input_record_uid,published) '
+                        f'SELECT path,parent,input_record_uid,? FROM accepted '
+                        f'WHERE path IN ({placeholders})',
+                        (time.time(), *chunk),
+                    )
                 self.db.execute(f'DELETE FROM jobs WHERE path IN ({placeholders})', tuple(chunk))
             else:
                 self.db.execute(f'UPDATE jobs SET attempts=attempts+1,retry_at=? WHERE path IN ({placeholders})',
@@ -598,6 +716,7 @@ class CheckpointSpool:
             'local_commits_this_process': self.local_commits,
             'cloud_commits_this_process': self.cloud_commits,
             'cloud_objects_this_process': self.cloud_objects,
+            'accepted_final_records': len(self.accepted),
             'batch_size': self.batch_size if self.batch_writer else 1,
             'sync_errors': self.errors, 'last_error_type': self.last_error,
             'worker_failure_type': self.worker_failure, 'spool_root': str(self.root)}

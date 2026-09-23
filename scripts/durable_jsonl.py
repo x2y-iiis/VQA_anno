@@ -248,7 +248,12 @@ def atomic_final_record_batch(rows, limiter=None):
 def atomic_jsonl_records(path, records, limiter=None):
     selected = IO_LIMITER if limiter is None else limiter
     with selected.admit() if isinstance(selected, PublicationLimiter) else selected:
+        records = list(records)
+        if not records:
+            raise ValueError('durable_jsonl_refuses_empty_record_set')
         payload = ''.join(json.dumps(record, ensure_ascii=False)+'\n' for record in records)
+        if not payload.strip():
+            raise ValueError('durable_jsonl_refuses_empty_payload')
         for attempt in range(3):
             temporary = None
             try:
@@ -260,6 +265,8 @@ def atomic_jsonl_records(path, records, limiter=None):
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temporary, path)
+                if not path.is_file() or path.stat().st_size != len(payload.encode('utf-8')):
+                    raise OSError('durable_jsonl_post_publish_size_mismatch')
                 # The source no longer exists after a successful rename. Avoid
                 # an unnecessary remote unlink while retaining failure cleanup.
                 temporary = None

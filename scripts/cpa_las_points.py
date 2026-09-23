@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import subprocess
 import time
 
@@ -16,7 +17,7 @@ import cv2
 import numpy as np
 import requests
 
-from local_json import atomic_json
+from prepare_cpa_comparison import atomic_json
 
 
 OPERATOR = {'operator_id': 'las_spatial_perception', 'operator_version': 'v1'}
@@ -66,11 +67,11 @@ def decode_points(response, image_size, event):
 
 
 class LasContactPointSelector:
-    def __init__(self, root: Path, *, cos_prefix=None,
-                 coscli=None, base_url=None, check_available=None, request_admission=None):
+    def __init__(self, root: Path, *, cos_prefix='cos://datasets-1409717487/video-cleaning/cpa-paired10/frames',
+                 coscli='/root/coscli', base_url=None, check_available=None, request_admission=None):
         self.root = Path(root)
-        self.cos_prefix = str(cos_prefix or os.environ.get('CPA_LAS_COS_PREFIX', '')).rstrip('/')
-        self.coscli = coscli or os.environ.get('LAS_COSCLI', 'coscli')
+        self.cos_prefix = cos_prefix.rstrip('/')
+        self.coscli = coscli
         self.base_url = (base_url or os.environ.get('LAS_BASE_URL', 'https://operator.las.cn-beijing.volces.com')).rstrip('/')
         self.check_available = check_available or (lambda: None)
         self.request_admission = request_admission
@@ -96,8 +97,6 @@ class LasContactPointSelector:
                 time.sleep(min(30, 3 * 2 ** attempt))
 
     def publish(self, source, digest, directory):
-        if not self.cos_prefix.startswith('cos://'):
-            raise RuntimeError('cpa_las_cos_prefix_must_be_configured')
         cache = directory / 'private-url.json'
         if cache.exists():
             saved = json.loads(cache.read_text())
@@ -174,7 +173,44 @@ class LasContactPointSelector:
                 raise RuntimeError('LAS contact submit failed: '+json.dumps(meta))
             delay = 5
             while True:
-                response = self.post(session, '/api/v1/poll', {**OPERATOR, 'task_id': meta['task_id']}, retries=4)
+                try:
+                    response = self.post(
+                        session,
+                        '/api/v1/poll',
+                        {**OPERATOR, 'task_id': meta['task_id']},
+                        retries=1,
+                    )
+                except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as error:
+                    # A failed Poll does not invalidate the asynchronous LAS
+                    # task.  In particular, bubbling a control-plane 429 to
+                    # the record retry loop used to re-run all earlier CPA
+                    # stages and could submit duplicate model work.  Keep the
+                    # persisted task_id and retry only Poll with bounded,
+                    # jittered backoff.
+                    status = (
+                        error.response.status_code
+                        if isinstance(error, requests.HTTPError)
+                        and error.response is not None
+                        else 0
+                    )
+                    if status not in {0, 429} and status < 500:
+                        raise
+                    retry_after = 0.0
+                    if isinstance(error, requests.HTTPError) and error.response is not None:
+                        try:
+                            retry_after = float(error.response.headers.get('Retry-After', 0))
+                        except (TypeError, ValueError):
+                            retry_after = 0.0
+                    sleep_seconds = max(delay, retry_after) * random.uniform(0.8, 1.2)
+                    print(
+                        'las_contact_poll_transient_retry '
+                        f'task_id={meta["task_id"]} status={status} '
+                        f'delay_seconds={sleep_seconds:.3f}',
+                        flush=True,
+                    )
+                    time.sleep(sleep_seconds)
+                    delay = min(60, delay * 1.5)
+                    continue
                 atomic_json(directory/'poll.json', response)
                 status = response['metadata']['task_status']
                 if status == 'COMPLETED':

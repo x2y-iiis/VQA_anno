@@ -7,7 +7,6 @@ Point identities remain stable when pair filtering removes previously approved p
 from __future__ import annotations
 
 from pathlib import Path
-import os
 import sys
 
 import cv2
@@ -16,12 +15,8 @@ import numpy as np
 from cpa_semantic_review import point_rows
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_tracker(repo=Path(os.environ.get('COTRACKER_REPO', PROJECT_ROOT/'third_party/co-tracker')),
-                 checkpoint=Path(os.environ.get(
-                     'COTRACKER_CHECKPOINT', PROJECT_ROOT/'models/cotracker/scaled_offline.pth')),
+def load_tracker(repo=Path('/mnt/co-tracker'),
+                 checkpoint=Path('/mnt/co-tracker/checkpoints/scaled_offline.pth'),
                  device='cuda'):
     if not Path(checkpoint).is_file():
         raise FileNotFoundError(checkpoint)
